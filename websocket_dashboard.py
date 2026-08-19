@@ -1,0 +1,593 @@
+"""
+Companies House Real-Time Dashboard - FastAPI WebSocket Server
+"""
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+import psycopg
+import json
+import asyncio
+from datetime import datetime
+import os
+from typing import Set, Dict
+import logging
+
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL")
+PORT = int(os.getenv("PORT", 8000))
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# FastAPI app
+app = FastAPI(title="Companies House Real-Time Dashboard")
+
+# CORS (for local development)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Store connected WebSocket clients
+connected_clients: Set[WebSocket] = set()
+
+# Database connection pool
+db_conn = None
+
+def get_db_connection():
+    """Get or create database connection."""
+    global db_conn
+    if db_conn is None:
+        db_conn = psycopg.connect(DATABASE_URL)
+    return db_conn
+
+# ============================================================================
+# HTML FRONTEND
+# ============================================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def get_dashboard():
+    """Serve the real-time dashboard."""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔍 Live Companies House Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: white;
+            padding: 20px 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        
+        h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        
+        .status {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        
+        .status.connected {
+            background: #10b981;
+            color: white;
+        }
+        
+        .status.disconnected {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .metric-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .metric-label {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        
+        .metric-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .companies-container {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .companies-header {
+            padding: 20px 30px;
+            background: #f8fafc;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        
+        .companies-header h2 {
+            color: #333;
+            font-size: 20px;
+        }
+        
+        .companies-list {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        
+        .company-card {
+            padding: 15px 30px;
+            border-bottom: 1px solid #e2e8f0;
+            transition: all 0.3s ease;
+            animation: slideIn 0.5s ease;
+        }
+        
+        .company-card:hover {
+            background: #f8fafc;
+        }
+        
+        .company-card.new {
+            background: #ecfdf5;
+            border-left: 4px solid #10b981;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+        
+        .company-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .company-number {
+            font-size: 12px;
+            color: #666;
+            background: #f1f5f9;
+            padding: 3px 8px;
+            border-radius: 4px;
+        }
+        
+        .company-name {
+            font-size: 16px;
+            font-weight: 600;
+            color: #333;
+        }
+        
+        .company-meta {
+            display: flex;
+            gap: 15px;
+            font-size: 13px;
+            color: #666;
+        }
+        
+        .sic-code {
+            background: #667eea;
+            color: white;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        
+        .source-type {
+            font-weight: 600;
+        }
+        
+        .source-type.target_sic { color: #10b981; }
+        .source-type.buzzword { color: #3b82f6; }
+        .source-type.restricted_sic { color: #ef4444; }
+        
+        .company-links {
+            margin-top: 10px;
+        }
+        
+        .company-links a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 13px;
+            margin-right: 15px;
+        }
+        
+        .company-links a:hover {
+            text-decoration: underline;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #999;
+        }
+        
+        .empty-state p {
+            font-size: 16px;
+        }
+        
+        .last-updated {
+            text-align: right;
+            padding: 10px 30px;
+            font-size: 12px;
+            color: #999;
+            background: #f8fafc;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔍 Live Companies House Dashboard</h1>
+            <div>
+                Status: <span id="connection-status" class="status disconnected">Connecting...</span>
+            </div>
+        </header>
+        
+        <div class="metrics">
+            <div class="metric-card">
+                <div class="metric-label">Target & Buzzword</div>
+                <div class="metric-value" id="metric-target">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Restricted SIC</div>
+                <div class="metric-value" id="metric-restricted">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Total Today</div>
+                <div class="metric-value" id="metric-total">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Connected Clients</div>
+                <div class="metric-value" id="metric-clients">0</div>
+            </div>
+        </div>
+        
+        <div class="companies-container">
+            <div class="companies-header">
+                <h2>📊 Live Company Feed</h2>
+            </div>
+            <div class="companies-list" id="companies-list">
+                <div class="empty-state">
+                    <p>⏳ Waiting for new companies...</p>
+                    <p style="font-size: 13px; margin-top: 10px;">Companies will appear here in real-time</p>
+                </div>
+            </div>
+            <div class="last-updated">
+                Last updated: <span id="last-updated">Never</span>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // WebSocket connection
+        let ws;
+        let companies = [];
+        
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                console.log('Connected to WebSocket');
+                document.getElementById('connection-status').textContent = 'Connected';
+                document.getElementById('connection-status').className = 'status connected';
+            };
+            
+            ws.onclose = function() {
+                console.log('Disconnected from WebSocket');
+                document.getElementById('connection-status').textContent = 'Disconnected';
+                document.getElementById('connection-status').className = 'status disconnected';
+                
+                // Reconnect after 3 seconds
+                setTimeout(connect, 3000);
+            };
+            
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'company') {
+                    addCompany(data.company);
+                } else if (data.type === 'metrics') {
+                    updateMetrics(data.metrics);
+                }
+            };
+        }
+        
+        function addCompany(company) {
+            // Add to beginning of array
+            companies.unshift(company);
+            
+            // Keep only last 50 companies
+            if (companies.length > 50) {
+                companies = companies.slice(0, 50);
+            }
+            
+            renderCompanies();
+        }
+        
+        function updateMetrics(metrics) {
+            document.getElementById('metric-target').textContent = metrics.target_count || 0;
+            document.getElementById('metric-restricted').textContent = metrics.restricted_count || 0;
+            document.getElementById('metric-total').textContent = metrics.total_count || 0;
+        }
+        
+        function renderCompanies() {
+            const list = document.getElementById('companies-list');
+            
+            if (companies.length === 0) {
+                list.innerHTML = `
+                    <div class="empty-state">
+                        <p>⏳ Waiting for new companies...</p>
+                        <p style="font-size: 13px; margin-top: 10px;">Companies will appear here in real-time</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            list.innerHTML = companies.map(company => `
+                <div class="company-card new">
+                    <div class="company-header">
+                        <span class="company-number">${company.company_number}</span>
+                        <span class="source-type ${company.source_type}">${formatSourceType(company.source_type)}</span>
+                    </div>
+                    <div class="company-name">${company.company_name}</div>
+                    <div class="company-meta">
+                        <span>📅 ${company.incorporation_date}</span>
+                        <span>🕐 ${formatAge(company.published_at)}</span>
+                        <span>${company.sic_codes ? company.sic_codes.slice(0, 3).map(sic => `<span class="sic-code">${sic}</span>`).join(' ') : ''}</span>
+                    </div>
+                    <div class="company-links">
+                        <a href="https://find-and-update.company-information.service.gov.uk/company/${company.company_number}" target="_blank">🏢 Companies House</a>
+                        <a href="https://www.google.com/search?q=${encodeURIComponent(company.company_name.replace(' Limited', '').replace(' Ltd', ''))}" target="_blank">🔍 Google</a>
+                    </div>
+                </div>
+            `).join('');
+            
+            // Update timestamp
+            document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+        }
+        
+        function formatSourceType(type) {
+            const formats = {
+                'target_sic': '🎯 Target SIC',
+                'buzzword': '✨ Buzzword',
+                'restricted_sic': '⚠️ Restricted'
+            };
+            return formats[type] || type;
+        }
+        
+        function formatAge(publishedAt) {
+            try {
+                const published = new Date(publishedAt);
+                const now = new Date();
+                const diff = Math.floor((now - published) / 1000);
+                
+                if (diff < 60) {
+                    return `${diff}s ago`;
+                } else if (diff < 3600) {
+                    return `${Math.floor(diff / 60)}m ago`;
+                } else {
+                    return `${Math.floor(diff / 3600)}h ago`;
+                }
+            } catch {
+                return 'N/A';
+            }
+        }
+        
+        // Connect on page load
+        connect();
+        
+        // Fetch initial metrics
+        fetch('/api/metrics')
+            .then(res => res.json())
+            .then(data => updateMetrics(data));
+    </script>
+</body>
+</html>
+    """
+
+# ============================================================================
+# WEBSOCKET ENDPOINT
+# ============================================================================
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """Handle WebSocket connections."""
+    await websocket.accept()
+    connected_clients.add(websocket)
+    
+    logger.info(f"Client connected. Total clients: {len(connected_clients)}")
+    
+    try:
+        # Send initial metrics
+        metrics = await get_metrics()
+        await websocket.send_json({
+            "type": "metrics",
+            "metrics": metrics
+        })
+        
+        # Keep connection alive
+        while True:
+            # Wait for messages (client might send ping)
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                # Send ping to keep connection alive
+                continue
+                
+    except WebSocketDisconnect:
+        connected_clients.remove(websocket)
+        logger.info(f"Client disconnected. Total clients: {len(connected_clients)}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        connected_clients.remove(websocket)
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.get("/api/metrics")
+async def get_metrics():
+    """Get current metrics from database."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            today = datetime.now().date().isoformat()
+            
+            # Target & Buzzword
+            cur.execute("""
+                SELECT COUNT(*) FROM screened_companies 
+                WHERE incorporation_date = %s 
+                AND source_type IN ('target_sic', 'buzzword')
+            """, (today,))
+            target_count = cur.fetchone()[0]
+            
+            # Restricted
+            cur.execute("""
+                SELECT COUNT(*) FROM screened_companies 
+                WHERE incorporation_date = %s 
+                AND source_type = 'restricted_sic'
+            """, (today,))
+            restricted_count = cur.fetchone()[0]
+            
+            # Total
+            cur.execute("""
+                SELECT COUNT(*) FROM screened_companies 
+                WHERE incorporation_date = %s
+            """, (today,))
+            total_count = cur.fetchone()[0]
+            
+            return {
+                "target_count": target_count,
+                "restricted_count": restricted_count,
+                "total_count": total_count
+            }
+    except Exception as e:
+        logger.error(f"Error getting metrics: {e}")
+        return {
+            "target_count": 0,
+            "restricted_count": 0,
+            "total_count": 0
+        }
+
+@app.get("/api/companies")
+async def get_companies(limit: int = 50):
+    """Get recent companies."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT company_number, company_name, incorporation_date, 
+                       sic_codes, source_type, published_at
+                FROM screened_companies
+                WHERE incorporation_date = CURRENT_DATE
+                ORDER BY published_at DESC
+                LIMIT %s
+            """, (limit,))
+            
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description]
+            
+            return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting companies: {e}")
+        return []
+
+# ============================================================================
+# BROADCAST FUNCTION (called by worker)
+# ============================================================================
+
+async def broadcast_company(company_data: dict):
+    """Broadcast new company to all connected clients."""
+    if not connected_clients:
+        return
+    
+    message = {
+        "type": "company",
+        "company": company_data
+    }
+    
+    disconnected = set()
+    
+    for client in connected_clients:
+        try:
+            await client.send_json(message)
+        except Exception as e:
+            logger.error(f"Error sending to client: {e}")
+            disconnected.add(client)
+    
+    # Remove disconnected clients
+    for client in disconnected:
+        connected_clients.remove(client)
+    
+    logger.info(f"Broadcasted company {company_data['company_number']} to {len(connected_clients)} clients")
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting Companies House Dashboard on port {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)websocket_dashboard.py
