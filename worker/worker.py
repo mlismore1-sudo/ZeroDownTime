@@ -1,6 +1,6 @@
 """
 Companies House Streaming Worker - Render Deployment
-DEBUG VERSION - Comprehensive logging to identify issues
+FIXED VERSION - Correctly handles nested event structure
 """
 
 import psycopg
@@ -33,9 +33,9 @@ RESTRICTED_SIC_CODES = {
 DATABASE_URL = os.getenv("DATABASE_URL")
 API_KEY = os.getenv("COMPANIES_HOUSE_STREAMING_API_KEY")
 
-# Logging - Set to DEBUG for detailed output
+# Logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -56,24 +56,18 @@ def classify_company(sic_codes: list, company_name: str) -> Optional[str]:
     Classify company based on SIC codes and name.
     Returns: 'target_sic', 'buzzword', 'restricted_sic', or None
     """
-    logger.debug(f"Classifying: SIC={sic_codes}, Name={company_name}")
-    
     # Check target SIC codes
     if sic_codes and any(str(sic) in TARGET_SIC_CODES for sic in sic_codes):
-        logger.debug(f"Matched target SIC")
         return "target_sic"
     
     # Check buzzwords
     if matches_buzzword(company_name):
-        logger.debug(f"Matched buzzword")
         return "buzzword"
     
     # Check restricted SIC codes
     if sic_codes and any(str(sic) in RESTRICTED_SIC_CODES for sic in sic_codes):
-        logger.debug(f"Matched restricted SIC")
         return "restricted_sic"
     
-    logger.debug(f"No match found")
     return None
 
 # ============================================================================
@@ -97,9 +91,7 @@ def get_checkpoint() -> int:
         with get_db_cursor() as cur:
             cur.execute("SELECT timepoint FROM stream_state WHERE id = 1")
             result = cur.fetchone()
-            checkpoint = result[0] if result else 0
-            logger.info(f"Got checkpoint: {checkpoint}")
-            return checkpoint
+            return result[0] if result else 0
     except Exception as e:
         logger.error(f"Error getting checkpoint: {e}")
         return 0
@@ -114,7 +106,6 @@ def save_checkpoint(timepoint: int):
                 ON CONFLICT (id) DO UPDATE
                 SET timepoint = %s, updated_at = NOW()
             """, (timepoint, timepoint))
-            logger.debug(f"Saved checkpoint: {timepoint}")
     except Exception as e:
         logger.error(f"Error saving checkpoint: {e}")
 
@@ -128,7 +119,6 @@ def update_worker_status(status: str, last_error: Optional[str] = None):
                 ON CONFLICT (id) DO UPDATE
                 SET status = %s, last_event_at = %s, last_error = %s, updated_at = NOW()
             """, (status, datetime.now(), last_error, status, datetime.now(), last_error))
-            logger.debug(f"Updated worker status: {status}")
     except Exception as e:
         logger.error(f"Error updating worker status: {e}")
 
@@ -169,47 +159,47 @@ def insert_company(company_data: dict, source_type: str):
         logger.error(f"❌ Error inserting company: {e}")
 
 # ============================================================================
-# EVENT PROCESSING
+# EVENT PROCESSING (FIXED)
 # ============================================================================
 
 def process_event(event: dict):
-    """Process a single streaming event with comprehensive logging."""
+    """Process a single streaming event."""
     try:
-        logger.debug(f"📥 Event received: {json.dumps(event, default=str)[:300]}")
+        # Check if it's a company-profile event
+        if event.get("resource_kind") != "company-profile":
+            return
+        
+        # Extract data from nested structure
+        data = event.get("data", {})
+        if not data:
+            return
         
         # Extract company number
-        company_number = event.get("company_number")
+        company_number = data.get("company_number")
         if not company_number:
-            logger.warning(f"⚠️ No company_number in event: {event}")
             return
         
         logger.info(f"🏢 Processing company: {company_number}")
         
-        # Extract fields
-        company_name = event.get("company_name", "")
-        date_of_creation = event.get("date_of_creation")
-        sic_codes = event.get("sic_codes", [])
-        published_at = event.get("published_at")
-        company_status = event.get("company_status", "active")
+        # Extract fields from data
+        company_name = data.get("company_name", "")
+        date_of_creation = data.get("date_of_creation")
+        sic_codes = data.get("sic_codes", [])
+        company_status = data.get("company_status", "active")
         
-        logger.info(f"  Name: {company_name}")
-        logger.info(f"  Date of creation: {date_of_creation}")
-        logger.info(f"  SIC codes: {sic_codes}")
-        logger.info(f"  Status: {company_status}")
+        # Extract event metadata
+        event_info = event.get("event", {})
+        published_at = event_info.get("published_at")
+        timepoint = event_info.get("timepoint")
         
-        # Check if incorporated today
+        # Only process companies incorporated today
         today = date.today().isoformat()
-        logger.info(f"  Today's date: {today}")
         
         if not date_of_creation:
-            logger.warning(f"⚠️ No date_of_creation, skipping")
             return
         
         if date_of_creation != today:
-            logger.info(f"⏭️ Skipping - not incorporated today (date: {date_of_creation})")
             return
-        
-        logger.info(f"✅ Date match - incorporated today")
         
         # Ensure sic_codes is a list
         if isinstance(sic_codes, str):
@@ -219,18 +209,11 @@ def process_event(event: dict):
                 sic_codes = [sic_codes]
         
         if not sic_codes:
-            logger.warning(f"⚠️ No SIC codes, skipping")
             return
         
         # Classify the company
-        logger.info(f"🔍 Classifying company...")
         source_type = classify_company(sic_codes, company_name)
-        
         if not source_type:
-            logger.info(f"⏭️ Skipping - no classification match")
-            logger.info(f"  SIC codes: {sic_codes}")
-            logger.info(f"  Target SICs: {TARGET_SIC_CODES}")
-            logger.info(f"  Name keywords: {TARGET_NAME_KEYWORDS}")
             return
         
         logger.info(f"✅ Classified as: {source_type}")
@@ -245,20 +228,17 @@ def process_event(event: dict):
             "published_at": published_at
         }
         
-        logger.info(f"💾 Inserting into database...")
         insert_company(company_data, source_type)
         
         # Update status
         update_worker_status("connected")
         
         # Save checkpoint
-        timepoint = event.get("timepoint")
         if timepoint:
             save_checkpoint(timepoint)
-            logger.debug(f"💾 Checkpoint saved: {timepoint}")
             
     except Exception as e:
-        logger.error(f"❌ ERROR in process_event: {e}", exc_info=True)
+        logger.error(f"❌ Error processing event: {e}")
         update_worker_status("error", str(e))
 
 # ============================================================================
@@ -294,14 +274,13 @@ def run_worker():
                         event = json.loads(line)
                         event_count += 1
                         
-                        if event_count % 100 == 0:
+                        if event_count % 1000 == 0:
                             logger.info(f"📊 Processed {event_count} events")
                         
                         process_event(event)
                         
                     except json.JSONDecodeError as e:
                         logger.error(f"❌ JSON decode error: {e}")
-                        logger.debug(f"Raw line: {line[:200]}")
                         continue
                         
         except Exception as e:
