@@ -1,6 +1,6 @@
 """
-Companies House Real-Time Dashboard - FINAL SORTED
-Always sorted by company number (highest first)
+Companies House Real-Time Dashboard - AUTO UPDATE TABLE
+New companies auto-appear in table without refresh
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -48,7 +48,7 @@ def get_db_connection():
     return db_conn
 
 # ============================================================================
-# HTML FRONTEND - SORTED BY COMPANY NUMBER
+# HTML FRONTEND - AUTO UPDATE TABLE
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -517,14 +517,14 @@ async def get_dashboard():
             ws = new WebSocket(wsUrl);
             
             ws.onopen = function() {
-                console.log('Connected');
+                console.log('WebSocket connected');
                 updateStatus(true);
                 reconnectAttempts = 0;
                 fetchInitialData();
             };
             
             ws.onclose = function() {
-                console.log('Disconnected');
+                console.log('WebSocket disconnected');
                 updateStatus(false);
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
                 reconnectAttempts++;
@@ -538,6 +538,8 @@ async def get_dashboard():
             
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
+                console.log('Received:', data);
+                
                 if (data.type === 'company') {
                     addCompany(data.company);
                 } else if (data.type === 'metrics') {
@@ -555,6 +557,7 @@ async def get_dashboard():
                 const companiesRes = await fetch('/api/companies?limit=100');
                 const companiesData = await companiesRes.json();
                 
+                console.log('Initial companies:', companiesData.length);
                 companies = companiesData;
                 renderCompanies();
             } catch (error) {
@@ -570,25 +573,24 @@ async def get_dashboard():
                 return;
             }
             
-            // Add to array (will be sorted by company number)
+            // Add to array
             companies.push(company);
             if (companies.length > 100) companies = companies.slice(0, 100);
             
             // Sort by company number (highest first)
             companies.sort((a, b) => {
-                // Compare as strings for proper numeric ordering
                 const numA = a.company_number || '';
                 const numB = b.company_number || '';
                 return numB.localeCompare(numA);
             });
+            
+            console.log('New company added, total:', companies.length);
             
             // Re-render table
             renderCompanies();
             
             // Update metrics
             fetch('/api/metrics').then(res => res.json()).then(updateMetrics);
-            
-            console.log('New company added:', company.company_number);
         }
         
         function updateMetrics(metrics) {
@@ -643,6 +645,8 @@ async def get_dashboard():
                     </td>
                 </tr>
             `).join('');
+            
+            console.log('Table rendered with', companies.length, 'companies');
         }
         
         function copyToClipboard(text, btn) {
@@ -809,6 +813,7 @@ async def get_companies(limit: int = 100):
 async def broadcast_company(company_data: dict):
     """Broadcast new company to all connected WebSocket clients."""
     if not connected_clients:
+        logger.info(f"No clients connected, skipping broadcast")
         return
     
     message = {
@@ -820,6 +825,7 @@ async def broadcast_company(company_data: dict):
     for client in connected_clients:
         try:
             await client.send_json(message)
+            logger.info(f"Broadcasted {company_data['company_number']} to client")
         except Exception as e:
             logger.error(f"Error sending to client: {e}")
             disconnected.add(client)
