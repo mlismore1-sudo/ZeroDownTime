@@ -1,6 +1,6 @@
 """
-Companies House Real-Time Dashboard - Professional Institutional Grade
-FINAL VERSION - Auto-feed + Copy button
+Companies House Real-Time Dashboard - FINAL SORTED
+Always sorted by company number (highest first)
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -48,7 +48,7 @@ def get_db_connection():
     return db_conn
 
 # ============================================================================
-# HTML FRONTEND - FINAL
+# HTML FRONTEND - SORTED BY COMPANY NUMBER
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -570,9 +570,17 @@ async def get_dashboard():
                 return;
             }
             
-            // Add to beginning of array
-            companies.unshift(company);
+            // Add to array (will be sorted by company number)
+            companies.push(company);
             if (companies.length > 100) companies = companies.slice(0, 100);
+            
+            // Sort by company number (highest first)
+            companies.sort((a, b) => {
+                // Compare as strings for proper numeric ordering
+                const numA = a.company_number || '';
+                const numB = b.company_number || '';
+                return numB.localeCompare(numA);
+            });
             
             // Re-render table
             renderCompanies();
@@ -774,7 +782,7 @@ async def get_metrics():
 
 @app.get("/api/companies")
 async def get_companies(limit: int = 100):
-    """Get today's companies - ORDER BY most recent first."""
+    """Get today's companies - sorted by company number DESC (highest first)."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -783,7 +791,7 @@ async def get_companies(limit: int = 100):
                        sic_codes, source_type, published_at
                 FROM screened_companies
                 WHERE incorporation_date = CURRENT_DATE
-                ORDER BY published_at DESC, company_number DESC
+                ORDER BY company_number DESC
                 LIMIT %s
             """, (limit,))
             
@@ -799,7 +807,7 @@ async def get_companies(limit: int = 100):
 # ============================================================================
 
 async def broadcast_company(company_data: dict):
-    """Broadcast new company to all connected clients."""
+    """Broadcast new company to all connected WebSocket clients."""
     if not connected_clients:
         return
     
