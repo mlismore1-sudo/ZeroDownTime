@@ -1,6 +1,6 @@
 """
 Companies House Streaming Worker - Render Deployment
-FIXED VERSION - Correctly handles nested event structure
+OPTIMIZED VERSION - Better logging, faster processing
 """
 
 import psycopg
@@ -33,7 +33,7 @@ RESTRICTED_SIC_CODES = {
 DATABASE_URL = os.getenv("DATABASE_URL")
 API_KEY = os.getenv("COMPANIES_HOUSE_STREAMING_API_KEY")
 
-# Logging
+# Logging - INFO level for production
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -123,8 +123,10 @@ def update_worker_status(status: str, last_error: Optional[str] = None):
         logger.error(f"Error updating worker status: {e}")
 
 def insert_company(company_data: dict, source_type: str):
-    """Insert or update company in database."""
+    """Insert or update company in database with timing info."""
     try:
+        start_time = time.time()
+        
         with get_db_cursor() as cur:
             cur.execute("""
                 INSERT INTO screened_companies (
@@ -154,17 +156,22 @@ def insert_company(company_data: dict, source_type: str):
                 source_type,
                 company_data["incorporation_date"]
             ))
-            logger.info(f"✅ INSERTED {company_data['company_number']} as {source_type}")
+            
+        insert_time = time.time() - start_time
+        logger.info(f"✅ INSERTED {company_data['company_number']} as {source_type} (DB: {insert_time:.2f}s)")
+        
     except Exception as e:
         logger.error(f"❌ Error inserting company: {e}")
 
 # ============================================================================
-# EVENT PROCESSING (FIXED)
+# EVENT PROCESSING - OPTIMIZED
 # ============================================================================
 
 def process_event(event: dict):
-    """Process a single streaming event."""
+    """Process a single streaming event with timing."""
     try:
+        start_time = time.time()
+        
         # Check if it's a company-profile event
         if event.get("resource_kind") != "company-profile":
             return
@@ -178,8 +185,6 @@ def process_event(event: dict):
         company_number = data.get("company_number")
         if not company_number:
             return
-        
-        logger.info(f"🏢 Processing company: {company_number}")
         
         # Extract fields from data
         company_name = data.get("company_name", "")
@@ -216,8 +221,6 @@ def process_event(event: dict):
         if not source_type:
             return
         
-        logger.info(f"✅ Classified as: {source_type}")
-        
         # Insert into database
         company_data = {
             "company_number": company_number,
@@ -229,6 +232,10 @@ def process_event(event: dict):
         }
         
         insert_company(company_data, source_type)
+        
+        # Calculate total processing time
+        total_time = time.time() - start_time
+        logger.info(f"⏱️ Total processing time: {total_time:.3f}s")
         
         # Update status
         update_worker_status("connected")
@@ -269,15 +276,20 @@ def run_worker():
                 logger.info("✅ Connected to Companies House stream")
                 
                 event_count = 0
+                companies_found = 0
+                
                 for line in response.iter_lines():
                     try:
                         event = json.loads(line)
                         event_count += 1
                         
-                        if event_count % 1000 == 0:
-                            logger.info(f"📊 Processed {event_count} events")
+                        # Log progress every 100 events
+                        if event_count % 100 == 0:
+                            logger.info(f"📊 Processed {event_count} events, found {companies_found} companies")
                         
-                        process_event(event)
+                        # Check if this event resulted in a company being inserted
+                        if process_event_with_count(event):
+                            companies_found += 1
                         
                     except json.JSONDecodeError as e:
                         logger.error(f"❌ JSON decode error: {e}")
@@ -289,6 +301,93 @@ def run_worker():
             update_worker_status("error", error_msg)
             logger.info("⏳ Reconnecting in 10 seconds...")
             time.sleep(10)
+
+def process_event_with_count(event: dict) -> bool:
+    """Process event and return True if company was inserted."""
+    try:
+        # Check if it's a company-profile event
+        if event.get("resource_kind") != "company-profile":
+            return False
+        
+        # Extract data from nested structure
+        data = event.get("data", {})
+        if not data:
+            return False
+        
+        # Extract company number
+        company_number = data.get("company_number")
+        if not company_number:
+            return False
+        
+        # Extract fields from data
+        company_name = data.get("company_name", "")
+        date_of_creation = data.get("date_of_creation")
+        sic_codes = data.get("sic_codes", [])
+        company_status = data.get("company_status", "active")
+        
+        # Extract event metadata
+        event_info = event.get("event", {})
+        published_at = event_info.get("published_at")
+        timepoint = event_info.get("timepoint")
+        
+        # Only process companies incorporated today
+        today = date.today().isoformat()
+        
+        if not date_of_creation:
+            return False
+        
+        if date_of_creation != today:
+            return False
+        
+        # Ensure sic_codes is a list
+        if isinstance(sic_codes, str):
+            try:
+                sic_codes = json.loads(sic_codes)
+            except:
+                sic_codes = [sic_codes]
+        
+        if not sic_codes:
+            return False
+        
+        # Classify the company
+        source_type = classify_company(sic_codes, company_name)
+        if not source_type:
+            return False
+        
+        # Log timing info
+        if published_at:
+            try:
+                published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                delay = datetime.now(published.tzinfo) - published
+                logger.info(f"⏱️ Delay from CH publication: {delay.total_seconds():.1f}s")
+            except:
+                pass
+        
+        # Insert into database
+        company_data = {
+            "company_number": company_number,
+            "company_name": company_name,
+            "incorporation_date": date_of_creation,
+            "company_status": company_status,
+            "sic_codes": sic_codes,
+            "published_at": published_at
+        }
+        
+        insert_company(company_data, source_type)
+        
+        # Update status
+        update_worker_status("connected")
+        
+        # Save checkpoint
+        if timepoint:
+            save_checkpoint(timepoint)
+        
+        return True
+            
+    except Exception as e:
+        logger.error(f"❌ Error processing event: {e}")
+        update_worker_status("error", str(e))
+        return False
 
 if __name__ == "__main__":
     if not DATABASE_URL:
