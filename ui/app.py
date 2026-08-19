@@ -1,6 +1,6 @@
 """
 Live Companies House Screener - Streamlit UI
-Reads from Supabase database (populated by Render worker)
+OPTIMIZED VERSION - Company number, sorting, faster refresh
 """
 
 import streamlit as st
@@ -9,6 +9,7 @@ import psycopg
 import json
 from datetime import datetime, date
 import logging
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,25 +42,27 @@ def format_age(published_at: str) -> str:
     try:
         published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
         age = datetime.now(published.tzinfo) - published
-        return f"{int(age.total_seconds() // 60)}m {int(age.total_seconds() % 60)}s"
+        minutes = int(age.total_seconds() // 60)
+        seconds = int(age.total_seconds() % 60)
+        return f"{minutes}m {seconds:02d}s"
     except:
         return "N/A"
 
 # ============================================================================
-# STREAMLIT UI
+# STREAMLIT UI - OPTIMIZED
 # ============================================================================
 
-# Page config
+# Page config - use wide mode
 st.set_page_config(page_title="Live Companies House Screener", layout="wide")
 
 # Header
 st.title("🔍 Live Companies House Screener")
-st.caption("Streaming newly incorporated UK companies")
+st.caption("Real-time UK company incorporations")
 
 # Metrics row
 col1, col2, col3 = st.columns(3)
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=2)  # Cache for 2 seconds only
 def get_company_counts():
     """Get counts for each category."""
     with get_db_cursor() as cur:
@@ -97,7 +100,7 @@ with col3:
     st.metric("📊 Total Today", total_count)
 
 # Worker status (from database)
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=5)
 def get_worker_status():
     """Get worker status from database."""
     with get_db_cursor() as cur:
@@ -124,14 +127,14 @@ st.sidebar.header("👤 Who is working?")
 user_name = st.sidebar.radio("Select user", ["Brad", "James"], key="user_selector")
 
 # ============================================================================
-# TARGET & BUZZWORD TABLE
+# TARGET & BUZZWORD TABLE - OPTIMIZED
 # ============================================================================
 
 st.header("🎯 Target & Buzzword Companies")
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=2)  # Cache for 2 seconds only
 def get_target_companies():
-    """Fetch target and buzzword companies."""
+    """Fetch target and buzzword companies - ORDER BY most recent first."""
     with get_db_cursor() as cur:
         cur.execute("""
             SELECT company_number, company_name, sic_codes, published_at,
@@ -139,7 +142,7 @@ def get_target_companies():
             FROM screened_companies
             WHERE incorporation_date = %s
             AND source_type IN ('target_sic', 'buzzword')
-            ORDER BY published_at DESC
+            ORDER BY published_at DESC, received_at DESC
         """, (today_in_uk(),))
         
         columns = [desc[0] for desc in cur.description]
@@ -160,15 +163,16 @@ if not target_df.empty:
     # Format age
     display_df['age'] = display_df['published_at'].apply(format_age)
     
-    # Show relevant columns
-    display_cols = ['company_name', 'sic_codes', 'age']
+    # Show columns with company number FIRST
+    display_cols = ['company_number', 'company_name', 'sic_codes', 'age']
     
     st.dataframe(
         display_df[display_cols],
         column_config={
+            "company_number": "Company Number",
             "company_name": "Company Name",
             "sic_codes": "SIC Codes",
-            "age": "Age (mm:ss)"
+            "age": "Age"
         },
         hide_index=True,
         use_container_width=True
@@ -182,14 +186,14 @@ else:
     st.info("No target or buzzword companies yet today")
 
 # ============================================================================
-# RESTRICTED SIC TABLE
+# RESTRICTED SIC TABLE - OPTIMIZED
 # ============================================================================
 
 st.header("⚠️ Restricted SIC Companies (for external review)")
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=2)  # Cache for 2 seconds only
 def get_restricted_companies():
-    """Fetch restricted SIC companies."""
+    """Fetch restricted SIC companies - ORDER BY most recent first."""
     with get_db_cursor() as cur:
         cur.execute("""
             SELECT company_number, company_name, sic_codes, published_at,
@@ -197,7 +201,7 @@ def get_restricted_companies():
             FROM screened_companies
             WHERE incorporation_date = %s
             AND source_type = 'restricted_sic'
-            ORDER BY published_at DESC
+            ORDER BY published_at DESC, received_at DESC
         """, (today_in_uk(),))
         
         columns = [desc[0] for desc in cur.description]
@@ -218,14 +222,16 @@ if not restricted_df.empty:
     # Format age
     display_df['age'] = display_df['published_at'].apply(format_age)
     
-    display_cols = ['company_name', 'sic_codes', 'age']
+    # Show columns with company number FIRST
+    display_cols = ['company_number', 'company_name', 'sic_codes', 'age']
     
     st.dataframe(
         display_df[display_cols],
         column_config={
+            "company_number": "Company Number",
             "company_name": "Company Name",
             "sic_codes": "SIC Codes",
-            "age": "Age (mm:ss)"
+            "age": "Age"
         },
         hide_index=True,
         use_container_width=True
@@ -243,7 +249,7 @@ else:
 
 st.sidebar.header(f"⭐ {user_name}'s Shortlist")
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=5)
 def get_user_shortlist(user: str):
     """Get user's shortlisted companies."""
     with get_db_cursor() as cur:
@@ -264,13 +270,20 @@ def get_user_shortlist(user: str):
 shortlist_df = get_user_shortlist(user_name)
 
 if not shortlist_df.empty:
-    st.sidebar.dataframe(shortlist_df[["company_name", "company_number"]], hide_index=True)
+    st.sidebar.dataframe(shortlist_df[["company_number", "company_name"]], hide_index=True)
     
     csv = shortlist_df.to_csv(index=False)
     st.sidebar.download_button("📥 Download Shortlist CSV", csv, f"{user_name}_shortlist.csv", "text/csv")
 else:
     st.sidebar.info("No shortlisted companies yet")
 
-# Auto-refresh
+# ============================================================================
+# AUTO-REFRESH - OPTIMIZED
+# ============================================================================
+
+# Use st_autorefresh for 15-second refresh
 import streamlit_autorefresh as st_autorefresh
 st_autorefresh.st_autorefresh(interval=15000, key="datarefresh")
+
+# Add a "Last updated" timestamp
+st.sidebar.caption(f"**Last updated:** {datetime.now().strftime('%H:%M:%S')}")
