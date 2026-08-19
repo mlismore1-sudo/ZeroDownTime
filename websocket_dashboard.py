@@ -1,6 +1,5 @@
 """
-Companies House Real-Time Dashboard - FastAPI WebSocket Server
-VERSION 2 - Auto-refresh, show existing companies, better status
+Companies House Real-Time Dashboard - Professional Institutional Grade
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -23,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # FastAPI app
-app = FastAPI(title="Companies House Real-Time Dashboard")
+app = FastAPI(title="Companies House Monitor")
 
 # CORS
 app.add_middleware(
@@ -48,215 +47,410 @@ def get_db_connection():
     return db_conn
 
 # ============================================================================
-# HTML FRONTEND - IMPROVED
+# HTML FRONTEND - PROFESSIONAL
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
-    """Serve the real-time dashboard."""
+    """Serve the professional dashboard."""
     return """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🔍 Live Companies House Dashboard</title>
+    <title>Companies House Monitor</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
+            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f5f7fa;
+            color: #1a1a1a;
+            line-height: 1.5;
         }
-        .container { max-width: 1400px; margin: 0 auto; }
+        
+        .container { max-width: 1600px; margin: 0 auto; padding: 0 20px; }
+        
+        /* Header */
         header {
             background: white;
-            padding: 20px 30px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
+            border-bottom: 1px solid #e1e4e8;
+            padding: 16px 0;
+            position: sticky;
+            top: 0;
+            z-index: 100;
         }
-        h1 { color: #333; font-size: 28px; margin-bottom: 10px; }
+        
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .logo {
+            font-size: 18px;
+            font-weight: 600;
+            color: #0d1117;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .logo-icon {
+            width: 24px;
+            height: 24px;
+            background: #0969da;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 14px;
+        }
+        
         .status-bar {
             display: flex;
             align-items: center;
-            gap: 15px;
-            margin-top: 15px;
-            padding: 10px 15px;
-            background: #f8fafc;
-            border-radius: 8px;
+            gap: 20px;
         }
-        .status-indicator {
-            width: 12px;
-            height: 12px;
+        
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            color: #1a7f37;
+            font-weight: 500;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: #1a7f37;
             border-radius: 50%;
             animation: pulse 2s infinite;
         }
-        .status-indicator.connected { background: #10b981; }
-        .status-indicator.disconnected { background: #ef4444; animation: none; }
+        
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
-        .status-text { font-weight: 600; }
-        .status-text.connected { color: #10b981; }
-        .status-text.disconnected { color: #ef4444; }
-        .last-update { color: #666; font-size: 13px; }
-        .metrics {
+        
+        .timestamp {
+            font-size: 13px;
+            color: #656d76;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+        }
+        
+        /* Metrics */
+        .metrics-bar {
+            background: white;
+            border-bottom: 1px solid #e1e4e8;
+            padding: 12px 0;
+        }
+        
+        .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 24px;
         }
-        .metric-card {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        
+        .metric {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
         }
-        .metric-label { font-size: 14px; color: #666; margin-bottom: 5px; }
-        .metric-value { font-size: 32px; font-weight: bold; color: #667eea; }
-        .companies-container {
+        
+        .metric-label {
+            font-size: 12px;
+            color: #656d76;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 500;
+        }
+        
+        .metric-value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #0d1117;
+            font-family: 'SF Mono', Monaco, monospace;
+        }
+        
+        .metric-value.target { color: #1a7f37; }
+        .metric-value.restricted { color: #cf222e; }
+        .metric-value.total { color: #0969da; }
+        
+        /* Content */
+        .content {
             background: white;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            margin: 20px 0;
+            border: 1px solid #e1e4e8;
+            border-radius: 6px;
             overflow: hidden;
         }
-        .companies-header {
-            padding: 20px 30px;
-            background: #f8fafc;
-            border-bottom: 2px solid #e2e8f0;
+        
+        .content-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid #e1e4e8;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            background: #f6f8fa;
         }
-        .companies-header h2 { color: #333; font-size: 20px; }
-        .companies-count { color: #666; font-size: 14px; }
-        .companies-list { max-height: 600px; overflow-y: auto; }
-        .company-card {
-            padding: 15px 30px;
-            border-bottom: 1px solid #e2e8f0;
-            transition: all 0.3s ease;
-            animation: slideIn 0.5s ease;
+        
+        .content-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #0d1117;
         }
-        .company-card:hover { background: #f8fafc; }
-        .company-card.new { background: #ecfdf5; border-left: 4px solid #10b981; }
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateX(-20px); }
-            to { opacity: 1; transform: translateX(0); }
+        
+        .content-count {
+            font-size: 13px;
+            color: #656d76;
+            font-family: 'SF Mono', Monaco, monospace;
         }
-        .company-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 8px;
+        
+        /* Table */
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
         }
+        
+        .thead {
+            background: #f6f8fa;
+            border-bottom: 1px solid #e1e4e8;
+        }
+        
+        .th {
+            padding: 12px 20px;
+            text-align: left;
+            font-weight: 600;
+            color: #656d76;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-size: 11px;
+        }
+        
+        .tr {
+            border-bottom: 1px solid #e1e4e8;
+            transition: background 0.15s;
+        }
+        
+        .tr:hover {
+            background: #f6f8fa;
+        }
+        
+        .tr.new {
+            background: #dafbe1;
+            animation: highlight 2s ease;
+        }
+        
+        @keyframes highlight {
+            0% { background: #dafbe1; }
+            100% { background: transparent; }
+        }
+        
+        .td {
+            padding: 12px 20px;
+            vertical-align: middle;
+        }
+        
         .company-number {
+            font-family: 'SF Mono', Monaco, monospace;
             font-size: 12px;
-            color: #666;
-            background: #f1f5f9;
-            padding: 3px 8px;
-            border-radius: 4px;
+            color: #656d76;
         }
-        .company-name { font-size: 16px; font-weight: 600; color: #333; }
-        .company-meta {
-            display: flex;
-            gap: 15px;
-            font-size: 13px;
-            color: #666;
-            flex-wrap: wrap;
+        
+        .company-name {
+            font-weight: 500;
+            color: #0d1117;
         }
+        
         .sic-code {
-            background: #667eea;
+            display: inline-block;
+            background: #0969da;
             color: white;
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-size: 12px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-family: 'SF Mono', Monaco, monospace;
+            margin-right: 4px;
         }
-        .source-type { font-weight: 600; }
-        .source-type.target_sic { color: #10b981; }
-        .source-type.buzzword { color: #3b82f6; }
-        .source-type.restricted_sic { color: #ef4444; }
-        .company-links { margin-top: 10px; }
-        .company-links a {
-            color: #667eea;
+        
+        .badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .badge.target_sic {
+            background: #dafbe1;
+            color: #1a7f37;
+        }
+        
+        .badge.buzzword {
+            background: #ddf4ff;
+            color: #0969da;
+        }
+        
+        .badge.restricted_sic {
+            background: #ffebe9;
+            color: #cf222e;
+        }
+        
+        .time-ago {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 12px;
+            color: #656d76;
+        }
+        
+        .links {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .links a {
+            color: #0969da;
             text-decoration: none;
-            font-size: 13px;
-            margin-right: 15px;
-        }
-        .company-links a:hover { text-decoration: underline; }
-        .empty-state { text-align: center; padding: 60px 20px; color: #999; }
-        .empty-state p { font-size: 16px; }
-        .last-updated {
-            text-align: right;
-            padding: 10px 30px;
             font-size: 12px;
-            color: #999;
-            background: #f8fafc;
+        }
+        
+        .links a:hover {
+            text-decoration: underline;
+        }
+        
+        /* Empty state */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #656d76;
+        }
+        
+        .empty-state p {
+            font-size: 14px;
+        }
+        
+        /* Scrollbar */
+        .table-container {
+            max-height: 700px;
+            overflow-y: auto;
+        }
+        
+        .table-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        .table-container::-webkit-scrollbar-track {
+            background: #f6f8fa;
+        }
+        
+        .table-container::-webkit-scrollbar-thumb {
+            background: #d0d7de;
+            border-radius: 4px;
+        }
+        
+        .table-container::-webkit-scrollbar-thumb:hover {
+            background: #8d96a0;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>🔍 Live Companies House Dashboard</h1>
-            <div class="status-bar">
-                <div class="status-indicator" id="status-indicator"></div>
-                <span class="status-text" id="status-text">Connecting...</span>
-                <span class="last-update" id="last-update">Last update: Never</span>
-            </div>
-        </header>
-        <div class="metrics">
-            <div class="metric-card">
-                <div class="metric-label">Target & Buzzword</div>
-                <div class="metric-value" id="metric-target">0</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Restricted SIC</div>
-                <div class="metric-value" id="metric-restricted">0</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Total Today</div>
-                <div class="metric-value" id="metric-total">0</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Connected Clients</div>
-                <div class="metric-value" id="metric-clients">1</div>
-            </div>
-        </div>
-        <div class="companies-container">
-            <div class="companies-header">
-                <h2>📊 Today's Companies</h2>
-                <span class="companies-count" id="companies-count">0 companies</span>
-            </div>
-            <div class="companies-list" id="companies-list">
-                <div class="empty-state">
-                    <p>⏳ Loading companies...</p>
+    <header>
+        <div class="container">
+            <div class="header-content">
+                <div class="logo">
+                    <div class="logo-icon">CH</div>
+                    Companies House Monitor
+                </div>
+                <div class="status-bar">
+                    <div class="status">
+                        <div class="status-dot"></div>
+                        <span id="status-text">Connecting...</span>
+                    </div>
+                    <div class="timestamp" id="timestamp">--:--:--</div>
                 </div>
             </div>
-            <div class="last-updated">Last updated: <span id="last-updated">Never</span></div>
+        </div>
+    </header>
+    
+    <div class="metrics-bar">
+        <div class="container">
+            <div class="metrics-grid">
+                <div class="metric">
+                    <div class="metric-label">Target & Buzzword</div>
+                    <div class="metric-value target" id="metric-target">0</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Restricted SIC</div>
+                    <div class="metric-value restricted" id="metric-restricted">0</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Total Today</div>
+                    <div class="metric-value total" id="metric-total">0</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Connected</div>
+                    <div class="metric-value" id="metric-clients">1</div>
+                </div>
+            </div>
         </div>
     </div>
+    
+    <div class="container">
+        <div class="content">
+            <div class="content-header">
+                <div class="content-title">Today's Incorporations</div>
+                <div class="content-count" id="companies-count">0 companies</div>
+            </div>
+            <div class="table-container">
+                <table class="table">
+                    <thead class="thead">
+                        <tr>
+                            <th class="th">Company Number</th>
+                            <th class="th">Company Name</th>
+                            <th class="th">SIC Codes</th>
+                            <th class="th">Type</th>
+                            <th class="th">Time</th>
+                            <th class="th">Links</th>
+                        </tr>
+                    </thead>
+                    <tbody id="companies-table">
+                        <tr>
+                            <td colspan="6" class="empty-state">
+                                <p>Loading companies...</p>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
     <script>
         let ws;
         let companies = [];
         let reconnectAttempts = 0;
         
         function updateStatus(connected) {
-            const indicator = document.getElementById('status-indicator');
             const text = document.getElementById('status-text');
-            const lastUpdate = document.getElementById('last-update');
+            const dot = document.querySelector('.status-dot');
+            const timestamp = document.getElementById('timestamp');
             
             if (connected) {
-                indicator.className = 'status-indicator connected';
-                text.className = 'status-text connected';
-                text.textContent = 'Live ●';
-                lastUpdate.textContent = 'Last update: ' + new Date().toLocaleTimeString();
+                text.textContent = 'Live';
+                text.style.color = '#1a7f37';
+                dot.style.background = '#1a7f37';
+                timestamp.textContent = new Date().toLocaleTimeString('en-GB');
             } else {
-                indicator.className = 'status-indicator disconnected';
-                text.className = 'status-text disconnected';
                 text.textContent = 'Disconnected';
+                text.style.color = '#cf222e';
+                dot.style.background = '#cf222e';
             }
         }
         
@@ -266,17 +460,15 @@ async def get_dashboard():
             ws = new WebSocket(wsUrl);
             
             ws.onopen = function() {
-                console.log('Connected to WebSocket');
+                console.log('Connected');
                 updateStatus(true);
                 reconnectAttempts = 0;
-                // Request initial data
                 fetchInitialData();
             };
             
             ws.onclose = function() {
-                console.log('Disconnected from WebSocket');
+                console.log('Disconnected');
                 updateStatus(false);
-                // Reconnect with exponential backoff
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
                 reconnectAttempts++;
                 setTimeout(connect, delay);
@@ -299,13 +491,11 @@ async def get_dashboard():
         
         async function fetchInitialData() {
             try {
-                // Fetch metrics
                 const metricsRes = await fetch('/api/metrics');
                 const metrics = await metricsRes.json();
                 updateMetrics(metrics);
                 
-                // Fetch today's companies
-                const companiesRes = await fetch('/api/companies?limit=50');
+                const companiesRes = await fetch('/api/companies?limit=100');
                 const companiesData = await companiesRes.json();
                 
                 companies = companiesData;
@@ -316,15 +506,13 @@ async def get_dashboard():
         }
         
         function addCompany(company) {
-            // Check if company already exists
             const exists = companies.some(c => c.company_number === company.company_number);
             if (exists) return;
             
             companies.unshift(company);
-            if (companies.length > 50) companies = companies.slice(0, 50);
+            if (companies.length > 100) companies = companies.slice(0, 100);
             renderCompanies();
             
-            // Update metrics
             fetch('/api/metrics').then(res => res.json()).then(updateMetrics);
         }
         
@@ -336,44 +524,49 @@ async def get_dashboard():
         }
         
         function renderCompanies() {
-            const list = document.getElementById('companies-list');
+            const tbody = document.getElementById('companies-table');
             const count = document.getElementById('companies-count');
             
             if (companies.length === 0) {
-                list.innerHTML = '<div class="empty-state"><p>⏳ No companies yet today</p><p style="font-size: 13px; margin-top: 10px;">Companies will appear here as they are incorporated</p></div>';
+                tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><p>No companies yet today</p></td></tr>';
                 count.textContent = '0 companies';
                 return;
             }
             
             count.textContent = `${companies.length} companies`;
             
-            list.innerHTML = companies.map(company => `
-                <div class="company-card new">
-                    <div class="company-header">
-                        <span class="company-number">${company.company_number}</span>
-                        <span class="source-type ${company.source_type}">${formatSourceType(company.source_type)}</span>
-                    </div>
-                    <div class="company-name">${company.company_name}</div>
-                    <div class="company-meta">
-                        <span>📅 ${company.incorporation_date}</span>
-                        <span>🕐 ${formatAge(company.published_at)}</span>
-                        <span>${company.sic_codes ? company.sic_codes.slice(0, 3).map(sic => `<span class="sic-code">${sic}</span>`).join(' ') : ''}</span>
-                    </div>
-                    <div class="company-links">
-                        <a href="https://find-and-update.company-information.service.gov.uk/company/${company.company_number}" target="_blank">🏢 Companies House</a>
-                        <a href="https://www.google.com/search?q=${encodeURIComponent(company.company_name.replace(' Limited', '').replace(' Ltd', ''))}" target="_blank">🔍 Google</a>
-                    </div>
-                </div>
+            tbody.innerHTML = companies.map(company => `
+                <tr class="tr new">
+                    <td class="td">
+                        <div class="company-number">${company.company_number}</div>
+                    </td>
+                    <td class="td">
+                        <div class="company-name">${company.company_name}</div>
+                    </td>
+                    <td class="td">
+                        ${company.sic_codes ? company.sic_codes.slice(0, 3).map(sic => `<span class="sic-code">${sic}</span>`).join('') : ''}
+                    </td>
+                    <td class="td">
+                        <span class="badge ${company.source_type}">${formatSourceType(company.source_type)}</span>
+                    </td>
+                    <td class="td">
+                        <div class="time-ago">${formatAge(company.published_at)}</div>
+                    </td>
+                    <td class="td">
+                        <div class="links">
+                            <a href="https://find-and-update.company-information.service.gov.uk/company/${company.company_number}" target="_blank">CH</a>
+                            <a href="https://www.google.com/search?q=${encodeURIComponent(company.company_name)}" target="_blank">Google</a>
+                        </div>
+                    </td>
+                </tr>
             `).join('');
-            
-            document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
         }
         
         function formatSourceType(type) {
             const formats = {
-                'target_sic': '🎯 Target SIC',
-                'buzzword': '✨ Buzzword',
-                'restricted_sic': '⚠️ Restricted'
+                'target_sic': 'Target',
+                'buzzword': 'Buzzword',
+                'restricted_sic': 'Restricted'
             };
             return formats[type] || type;
         }
@@ -383,9 +576,9 @@ async def get_dashboard():
                 const published = new Date(publishedAt);
                 const now = new Date();
                 const diff = Math.floor((now - published) / 1000);
-                if (diff < 60) return `${diff}s ago`;
-                else if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-                else return `${Math.floor(diff / 3600)}h ago`;
+                if (diff < 60) return `${diff}s`;
+                else if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+                else return `${Math.floor(diff / 3600)}h`;
             } catch { return 'N/A'; }
         }
         
@@ -393,10 +586,10 @@ async def get_dashboard():
         setInterval(() => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 fetch('/api/metrics').then(res => res.json()).then(updateMetrics);
+                document.getElementById('timestamp').textContent = new Date().toLocaleTimeString('en-GB');
             }
         }, 5000);
         
-        // Connect on page load
         connect();
     </script>
 </body>
@@ -415,19 +608,16 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"Client connected. Total clients: {len(connected_clients)}")
     
     try:
-        # Send initial metrics
         metrics = await get_metrics()
         await websocket.send_json({
             "type": "metrics",
             "metrics": metrics
         })
         
-        # Keep connection alive with periodic pings
         while True:
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
             except asyncio.TimeoutError:
-                # Send ping to keep connection alive
                 try:
                     await websocket.send_json({"type": "ping"})
                 except:
@@ -482,7 +672,7 @@ async def get_metrics():
         return {"target_count": 0, "restricted_count": 0, "total_count": 0}
 
 @app.get("/api/companies")
-async def get_companies(limit: int = 50):
+async def get_companies(limit: int = 100):
     """Get today's companies - ORDER BY most recent first."""
     try:
         conn = get_db_connection()
