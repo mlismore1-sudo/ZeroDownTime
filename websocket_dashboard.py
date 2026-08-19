@@ -1,6 +1,6 @@
 """
-Companies House Real-Time Dashboard - AUTO UPDATE TABLE
-New companies auto-appear in table without refresh
+Companies House Real-Time Dashboard - SORTED BY TIME
+Most recent results at the top (lowest time ago)
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -48,7 +48,7 @@ def get_db_connection():
     return db_conn
 
 # ============================================================================
-# HTML FRONTEND - AUTO UPDATE TABLE
+# HTML FRONTEND - SORTED BY TIME
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -577,11 +577,11 @@ async def get_dashboard():
             companies.push(company);
             if (companies.length > 100) companies = companies.slice(0, 100);
             
-            // Sort by company number (highest first)
+            // Sort by published_at (most recent first)
             companies.sort((a, b) => {
-                const numA = a.company_number || '';
-                const numB = b.company_number || '';
-                return numB.localeCompare(numA);
+                const timeA = new Date(a.published_at || 0);
+                const timeB = new Date(b.published_at || 0);
+                return timeB - timeA; // Descending (most recent first)
             });
             
             console.log('New company added, total:', companies.length);
@@ -786,7 +786,7 @@ async def get_metrics():
 
 @app.get("/api/companies")
 async def get_companies(limit: int = 100):
-    """Get today's companies - sorted by company number DESC (highest first)."""
+    """Get today's companies - sorted by published_at DESC (most recent first)."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -795,7 +795,7 @@ async def get_companies(limit: int = 100):
                        sic_codes, source_type, published_at
                 FROM screened_companies
                 WHERE incorporation_date = CURRENT_DATE
-                ORDER BY company_number DESC
+                ORDER BY published_at DESC
                 LIMIT %s
             """, (limit,))
             
