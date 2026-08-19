@@ -1,8 +1,9 @@
 """
 Companies House Real-Time Dashboard - FastAPI WebSocket Server
+VERSION 2 - Auto-refresh, show existing companies, better status
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg
@@ -47,7 +48,7 @@ def get_db_connection():
     return db_conn
 
 # ============================================================================
-# HTML FRONTEND
+# HTML FRONTEND - IMPROVED
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -77,15 +78,31 @@ async def get_dashboard():
             margin-bottom: 20px;
         }
         h1 { color: #333; font-size: 28px; margin-bottom: 10px; }
-        .status {
-            display: inline-block;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: 600;
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-top: 15px;
+            padding: 10px 15px;
+            background: #f8fafc;
+            border-radius: 8px;
         }
-        .status.connected { background: #10b981; color: white; }
-        .status.disconnected { background: #ef4444; color: white; }
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        .status-indicator.connected { background: #10b981; }
+        .status-indicator.disconnected { background: #ef4444; animation: none; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .status-text { font-weight: 600; }
+        .status-text.connected { color: #10b981; }
+        .status-text.disconnected { color: #ef4444; }
+        .last-update { color: #666; font-size: 13px; }
         .metrics {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -110,8 +127,12 @@ async def get_dashboard():
             padding: 20px 30px;
             background: #f8fafc;
             border-bottom: 2px solid #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         .companies-header h2 { color: #333; font-size: 20px; }
+        .companies-count { color: #666; font-size: 14px; }
         .companies-list { max-height: 600px; overflow-y: auto; }
         .company-card {
             padding: 15px 30px;
@@ -144,6 +165,7 @@ async def get_dashboard():
             gap: 15px;
             font-size: 13px;
             color: #666;
+            flex-wrap: wrap;
         }
         .sic-code {
             background: #667eea;
@@ -179,7 +201,11 @@ async def get_dashboard():
     <div class="container">
         <header>
             <h1>🔍 Live Companies House Dashboard</h1>
-            <div>Status: <span id="connection-status" class="status disconnected">Connecting...</span></div>
+            <div class="status-bar">
+                <div class="status-indicator" id="status-indicator"></div>
+                <span class="status-text" id="status-text">Connecting...</span>
+                <span class="last-update" id="last-update">Last update: Never</span>
+            </div>
         </header>
         <div class="metrics">
             <div class="metric-card">
@@ -196,15 +222,17 @@ async def get_dashboard():
             </div>
             <div class="metric-card">
                 <div class="metric-label">Connected Clients</div>
-                <div class="metric-value" id="metric-clients">0</div>
+                <div class="metric-value" id="metric-clients">1</div>
             </div>
         </div>
         <div class="companies-container">
-            <div class="companies-header"><h2>📊 Live Company Feed</h2></div>
+            <div class="companies-header">
+                <h2>📊 Today's Companies</h2>
+                <span class="companies-count" id="companies-count">0 companies</span>
+            </div>
             <div class="companies-list" id="companies-list">
                 <div class="empty-state">
-                    <p>⏳ Waiting for new companies...</p>
-                    <p style="font-size: 13px; margin-top: 10px;">Companies will appear here in real-time</p>
+                    <p>⏳ Loading companies...</p>
                 </div>
             </div>
             <div class="last-updated">Last updated: <span id="last-updated">Never</span></div>
@@ -213,6 +241,24 @@ async def get_dashboard():
     <script>
         let ws;
         let companies = [];
+        let reconnectAttempts = 0;
+        
+        function updateStatus(connected) {
+            const indicator = document.getElementById('status-indicator');
+            const text = document.getElementById('status-text');
+            const lastUpdate = document.getElementById('last-update');
+            
+            if (connected) {
+                indicator.className = 'status-indicator connected';
+                text.className = 'status-text connected';
+                text.textContent = 'Live ●';
+                lastUpdate.textContent = 'Last update: ' + new Date().toLocaleTimeString();
+            } else {
+                indicator.className = 'status-indicator disconnected';
+                text.className = 'status-text disconnected';
+                text.textContent = 'Disconnected';
+            }
+        }
         
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -220,19 +266,26 @@ async def get_dashboard():
             ws = new WebSocket(wsUrl);
             
             ws.onopen = function() {
-                console.log('Connected');
-                document.getElementById('connection-status').textContent = 'Connected';
-                document.getElementById('connection-status').className = 'status connected';
+                console.log('Connected to WebSocket');
+                updateStatus(true);
+                reconnectAttempts = 0;
+                // Request initial data
+                fetchInitialData();
             };
             
             ws.onclose = function() {
-                console.log('Disconnected');
-                document.getElementById('connection-status').textContent = 'Disconnected';
-                document.getElementById('connection-status').className = 'status disconnected';
-                setTimeout(connect, 3000);
+                console.log('Disconnected from WebSocket');
+                updateStatus(false);
+                // Reconnect with exponential backoff
+                const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
+                reconnectAttempts++;
+                setTimeout(connect, delay);
             };
             
-            ws.onerror = function(error) { console.error('WebSocket error:', error); };
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                updateStatus(false);
+            };
             
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
@@ -244,24 +297,56 @@ async def get_dashboard():
             };
         }
         
+        async function fetchInitialData() {
+            try {
+                // Fetch metrics
+                const metricsRes = await fetch('/api/metrics');
+                const metrics = await metricsRes.json();
+                updateMetrics(metrics);
+                
+                // Fetch today's companies
+                const companiesRes = await fetch('/api/companies?limit=50');
+                const companiesData = await companiesRes.json();
+                
+                companies = companiesData;
+                renderCompanies();
+            } catch (error) {
+                console.error('Error fetching initial data:', error);
+            }
+        }
+        
         function addCompany(company) {
+            // Check if company already exists
+            const exists = companies.some(c => c.company_number === company.company_number);
+            if (exists) return;
+            
             companies.unshift(company);
             if (companies.length > 50) companies = companies.slice(0, 50);
             renderCompanies();
+            
+            // Update metrics
+            fetch('/api/metrics').then(res => res.json()).then(updateMetrics);
         }
         
         function updateMetrics(metrics) {
             document.getElementById('metric-target').textContent = metrics.target_count || 0;
             document.getElementById('metric-restricted').textContent = metrics.restricted_count || 0;
             document.getElementById('metric-total').textContent = metrics.total_count || 0;
+            document.getElementById('companies-count').textContent = `${metrics.total_count} companies`;
         }
         
         function renderCompanies() {
             const list = document.getElementById('companies-list');
+            const count = document.getElementById('companies-count');
+            
             if (companies.length === 0) {
-                list.innerHTML = '<div class="empty-state"><p>⏳ Waiting for new companies...</p></div>';
+                list.innerHTML = '<div class="empty-state"><p>⏳ No companies yet today</p><p style="font-size: 13px; margin-top: 10px;">Companies will appear here as they are incorporated</p></div>';
+                count.textContent = '0 companies';
                 return;
             }
+            
+            count.textContent = `${companies.length} companies`;
+            
             list.innerHTML = companies.map(company => `
                 <div class="company-card new">
                     <div class="company-header">
@@ -280,6 +365,7 @@ async def get_dashboard():
                     </div>
                 </div>
             `).join('');
+            
             document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
         }
         
@@ -303,8 +389,15 @@ async def get_dashboard():
             } catch { return 'N/A'; }
         }
         
+        // Auto-refresh metrics every 5 seconds
+        setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                fetch('/api/metrics').then(res => res.json()).then(updateMetrics);
+            }
+        }, 5000);
+        
+        // Connect on page load
         connect();
-        fetch('/api/metrics').then(res => res.json()).then(data => updateMetrics(data));
     </script>
 </body>
 </html>
@@ -329,12 +422,16 @@ async def websocket_endpoint(websocket: WebSocket):
             "metrics": metrics
         })
         
-        # Keep connection alive
+        # Keep connection alive with periodic pings
         while True:
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
             except asyncio.TimeoutError:
-                continue
+                # Send ping to keep connection alive
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except:
+                    break
                 
     except WebSocketDisconnect:
         connected_clients.remove(websocket)
@@ -386,7 +483,7 @@ async def get_metrics():
 
 @app.get("/api/companies")
 async def get_companies(limit: int = 50):
-    """Get recent companies."""
+    """Get today's companies - ORDER BY most recent first."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -395,7 +492,7 @@ async def get_companies(limit: int = 50):
                        sic_codes, source_type, published_at
                 FROM screened_companies
                 WHERE incorporation_date = CURRENT_DATE
-                ORDER BY published_at DESC
+                ORDER BY published_at DESC, company_number DESC
                 LIMIT %s
             """, (limit,))
             
