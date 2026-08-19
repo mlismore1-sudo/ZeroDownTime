@@ -1,5 +1,6 @@
 """
 Companies House Real-Time Dashboard - Professional Institutional Grade
+FINAL VERSION - Auto-feed + Copy button
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -47,7 +48,7 @@ def get_db_connection():
     return db_conn
 
 # ============================================================================
-# HTML FRONTEND - PROFESSIONAL
+# HTML FRONTEND - FINAL
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -244,7 +245,7 @@ async def get_dashboard():
         
         .tr.new {
             background: #dafbe1;
-            animation: highlight 2s ease;
+            animation: highlight 3s ease;
         }
         
         @keyframes highlight {
@@ -263,9 +264,41 @@ async def get_dashboard():
             color: #656d76;
         }
         
+        .company-name-cell {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
         .company-name {
             font-weight: 500;
             color: #0d1117;
+        }
+        
+        .copy-btn {
+            background: #f6f8fa;
+            border: 1px solid #d0d7de;
+            border-radius: 4px;
+            padding: 2px 6px;
+            cursor: pointer;
+            font-size: 11px;
+            color: #656d76;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .copy-btn:hover {
+            background: #eaeef2;
+            border-color: #8d96a0;
+            color: #0d1117;
+        }
+        
+        .copy-btn.copied {
+            background: #1a7f37;
+            border-color: #1a7f37;
+            color: white;
         }
         
         .sic-code {
@@ -358,6 +391,28 @@ async def get_dashboard():
         .table-container::-webkit-scrollbar-thumb:hover {
             background: #8d96a0;
         }
+        
+        /* Toast notification */
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #0d1117;
+            color: white;
+            padding: 12px 20px;
+            border-radius: 6px;
+            font-size: 13px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.3s;
+            z-index: 1000;
+        }
+        
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
     </style>
 </head>
 <body>
@@ -431,6 +486,8 @@ async def get_dashboard():
             </div>
         </div>
     </div>
+    
+    <div class="toast" id="toast">Copied to clipboard!</div>
     
     <script>
         let ws;
@@ -506,14 +563,24 @@ async def get_dashboard():
         }
         
         function addCompany(company) {
+            // Check if company already exists
             const exists = companies.some(c => c.company_number === company.company_number);
-            if (exists) return;
+            if (exists) {
+                console.log('Company already exists:', company.company_number);
+                return;
+            }
             
+            // Add to beginning of array
             companies.unshift(company);
             if (companies.length > 100) companies = companies.slice(0, 100);
+            
+            // Re-render table
             renderCompanies();
             
+            // Update metrics
             fetch('/api/metrics').then(res => res.json()).then(updateMetrics);
+            
+            console.log('New company added:', company.company_number);
         }
         
         function updateMetrics(metrics) {
@@ -535,13 +602,21 @@ async def get_dashboard():
             
             count.textContent = `${companies.length} companies`;
             
-            tbody.innerHTML = companies.map(company => `
-                <tr class="tr new">
+            tbody.innerHTML = companies.map((company, index) => `
+                <tr class="tr ${index < 5 ? 'new' : ''}">
                     <td class="td">
                         <div class="company-number">${company.company_number}</div>
                     </td>
                     <td class="td">
-                        <div class="company-name">${company.company_name}</div>
+                        <div class="company-name-cell">
+                            <div class="company-name">${company.company_name}</div>
+                            <button class="copy-btn" onclick="copyToClipboard('${company.company_name.replace(/'/g, "\\'")}', this)">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                                </svg>
+                            </button>
+                        </div>
                     </td>
                     <td class="td">
                         ${company.sic_codes ? company.sic_codes.slice(0, 3).map(sic => `<span class="sic-code">${sic}</span>`).join('') : ''}
@@ -560,6 +635,32 @@ async def get_dashboard():
                     </td>
                 </tr>
             `).join('');
+        }
+        
+        function copyToClipboard(text, btn) {
+            navigator.clipboard.writeText(text).then(() => {
+                // Show visual feedback
+                btn.classList.add('copied');
+                btn.innerHTML = '✓';
+                
+                // Show toast
+                const toast = document.getElementById('toast');
+                toast.classList.add('show');
+                
+                // Reset after 2 seconds
+                setTimeout(() => {
+                    btn.classList.remove('copied');
+                    btn.innerHTML = `
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+                    `;
+                    toast.classList.remove('show');
+                }, 2000);
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+            });
         }
         
         function formatSourceType(type) {
