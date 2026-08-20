@@ -9,8 +9,6 @@ services:
       - key: SSE_URL
         value: https://stream.companieshouse.gov.uk/
       - key: DATABASE_FILE
-        value: /data/companies.db
-    disk:
-      name: data
-      mountPath: /data
-      sizeGB: 1
+        value: ./companies.db
+      - key: PORT
+        value: 8000
