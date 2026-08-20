@@ -1,1 +1,16 @@
-
+services:
+  - type: web
+    name: companies-house-monitor
+    env: python
+    startCommand: python main.py
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: SSE_URL
+        value: https://stream.companieshouse.gov.uk/
+      - key: DATABASE_FILE
+        value: /data/companies.db
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
