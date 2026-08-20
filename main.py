@@ -1,6 +1,6 @@
 """
-Companies House Real-Time Monitor - Render Version
-Dashboard-only mode (SSE processor disabled for stability)
+Companies House Real-Time Monitor - Production Version
+Real-time SSE streaming with proper async handling
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -11,11 +11,9 @@ import json
 import asyncio
 import os
 import httpx
-import signal
 from datetime import datetime, timezone
 from typing import Set, Optional
 import logging
-import threading
 import base64
 
 # Configuration
@@ -58,6 +56,7 @@ connected_clients: Set[WebSocket] = set()
 # Global state
 shutdown_flag = False
 last_event_id = None
+db_lock = asyncio.Lock()
 
 # ============================================================================
 # DATABASE FUNCTIONS
@@ -89,8 +88,8 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-def insert_company(company_data: dict, source_type: str):
-    """Insert company into database."""
+def insert_company_sync(company_data: dict, source_type: str):
+    """Insert company into database (sync)."""
     try:
         conn = get_db_connection()
         with conn:
@@ -111,7 +110,12 @@ def insert_company(company_data: dict, source_type: str):
     except Exception as e:
         logger.error(f"Error inserting: {e}")
 
-def get_companies(limit: int = 100):
+async def insert_company(company_data: dict, source_type: str):
+    """Insert company into database (async wrapper)."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, insert_company_sync, company_data, source_type)
+
+async def get_companies(limit: int = 100):
     """Get today's companies from database."""
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     
@@ -130,7 +134,7 @@ def get_companies(limit: int = 100):
     
     return [dict(row) for row in rows]
 
-def get_metrics():
+async def get_metrics():
     """Get metrics from database."""
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     
@@ -163,7 +167,7 @@ def get_metrics():
     }
 
 # ============================================================================
-# SSE STREAM PROCESSING (DISABLED)
+# SSE STREAM PROCESSING
 # ============================================================================
 
 def classify_company(sic_codes: list, company_name: str) -> Optional[str]:
@@ -214,8 +218,8 @@ def process_event(event_data: dict) -> Optional[dict]:
         logger.error(f"Error processing event: {e}")
         return None
 
-async def broadcast_company(company_data: dict):
-    """Broadcast to all WebSocket clients."""
+async def broadcast_to_clients(company_data: dict):
+    """Broadcast company to all connected WebSocket clients."""
     if not connected_clients:
         return
     
@@ -235,13 +239,113 @@ async def broadcast_company(company_data: dict):
     for client in disconnected:
         connected_clients.remove(client)
 
-def fetch_and_process_events():
-    """Fetch events from Companies House SSE stream - DISABLED FOR NOW."""
-    logger.info("⚠️  SSE processor is DISABLED")
-    logger.info("To enable: Uncomment thread.start() in startup_event()")
-    # This function is disabled to prevent crashes
-    # When enabled, it connects to Companies House SSE stream
-    pass
+async def process_and_broadcast(company_data: dict):
+    """Process company and broadcast to clients."""
+    # Insert to database
+    await insert_company(company_data, company_data['source_type'])
+    
+    # Broadcast to clients
+    await broadcast_to_clients(company_data)
+
+async def sse_event_generator(client: httpx.AsyncClient, headers: dict):
+    """Generate SSE events from the stream."""
+    async with client.stream("GET", SSE_URL, headers=headers, timeout=60.0) as response:
+        response.raise_for_status()
+        logger.info("✓ Connected to SSE stream")
+        
+        async for line in response.aiter_lines():
+            if shutdown_flag:
+                break
+            
+            if not line:
+                continue
+            
+            if line.startswith("id:"):
+                global last_event_id
+                last_event_id = line[3:].strip()
+                continue
+            
+            if line.startswith("data:"):
+                try:
+                    event_data = json.loads(line[5:])
+                    yield event_data
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON error: {e}")
+                    continue
+
+async def fetch_and_process_events():
+    """Fetch and process SSE events - runs as async task."""
+    global shutdown_flag
+    
+    logger.info("=" * 60)
+    logger.info("Starting SSE stream processor...")
+    logger.info(f"API Key configured: {bool(API_KEY)}")
+    logger.info(f"API Key length: {len(API_KEY) if API_KEY else 0}")
+    logger.info(f"SSE URL: {SSE_URL}")
+    logger.info("=" * 60)
+    
+    if not API_KEY:
+        logger.error("❌ API_KEY not set!")
+        return
+    
+    # Create Basic Auth header
+    auth_string = f"{API_KEY}:"
+    auth_bytes = base64.b64encode(auth_string.encode()).decode('utf-8')
+    auth_header = f"Basic {auth_bytes}"
+    
+    retry_count = 0
+    max_retries = 100
+    
+    while not shutdown_flag:
+        try:
+            headers = {
+                "Accept": "application/json",
+                "Authorization": auth_header,
+                "User-Agent": "Companies-House-Monitor/1.0"
+            }
+            
+            if last_event_id:
+                headers["Last-Event-ID"] = last_event_id
+            
+            logger.info(f"Connecting to {SSE_URL}...")
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async for event_data in sse_event_generator(client, headers):
+                    if shutdown_flag:
+                        break
+                    
+                    company_data = process_event(event_data)
+                    
+                    if company_data:
+                        await process_and_broadcast(company_data)
+            
+            # If we get here, connection was lost
+            logger.warning("SSE connection lost, reconnecting...")
+            retry_count += 1
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ HTTP Error: {e.response.status_code}")
+            logger.error(f"Response: {e.response.text[:200] if hasattr(e.response, 'text') else 'N/A'}")
+            retry_count += 1
+            
+            if e.response.status_code in [400, 401, 403]:
+                logger.error("❌ Auth/Request error - stopping retries")
+                return
+        
+        except Exception as e:
+            logger.error(f"❌ SSE Error: {e}")
+            logger.error(f"Type: {type(e).__name__}")
+            retry_count += 1
+        
+        if retry_count >= max_retries:
+            logger.error(f"❌ Max retries ({max_retries}) reached")
+            return
+        
+        if not shutdown_flag and retry_count > 0:
+            logger.info(f"Retrying in 30s... ({retry_count}/{max_retries})")
+            await asyncio.sleep(30)
+    
+    logger.info("SSE processor shutdown complete")
 
 # ============================================================================
 # HTML DASHBOARD
@@ -326,7 +430,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"✓ Client connected. Total: {len(connected_clients)}")
     
     try:
-        metrics = get_metrics()
+        metrics = await get_metrics()
         await websocket.send_json({"type": "metrics", "metrics": metrics})
         
         while True:
@@ -347,11 +451,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/metrics")
 async def api_metrics():
-    return get_metrics()
+    return await get_metrics()
 
 @app.get("/api/companies")
 async def api_companies(limit: int = 100):
-    return get_companies(limit)
+    return await get_companies(limit)
 
 @app.on_event("startup")
 async def startup_event():
@@ -359,8 +463,11 @@ async def startup_event():
     logger.info("Companies House Monitor - Starting")
     logger.info("=" * 60)
     init_db()
-    logger.info("⚠️  SSE processor DISABLED - dashboard-only mode")
-    logger.info("To enable real-time updates: Uncomment thread.start() in startup_event()")
+    
+    # Start SSE processor as background task
+    logger.info("Starting SSE stream processor...")
+    asyncio.create_task(fetch_and_process_events())
+    logger.info("✓ SSE processor started")
 
 @app.on_event("shutdown")
 async def shutdown_event():
