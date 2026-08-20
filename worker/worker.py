@@ -1,402 +1,330 @@
 """
-Companies House Streaming Worker - Render Deployment
-OPTIMIZED VERSION - Better logging, faster processing
+Companies House Real-Time Worker - FIXED DATE
+Always uses current date (not hardcoded)
 """
 
-import psycopg
-import requests
+import asyncio
 import json
-import time
 import os
+import signal
+import sys
+from datetime import datetime, timezone
+from typing import Set, Optional
 import logging
-from datetime import date, datetime
-from typing import Optional
-from contextlib import contextmanager
+import httpx
+import psycopg
+from psycopg import sql
+import backoff
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-TARGET_SIC_CODES = {"62012", "63110", "64209", "64301", "64999", "72110"}
-
-TARGET_NAME_KEYWORDS = [
-    "labs", "global", "holdings", "capital", "ai", "technology", 
-    "technologies", "uk", "london", "europe", "inc", "pty", "pvt", "group"
-]
-
-RESTRICTED_SIC_CODES = {
-    "10110", "10130", "10110", "10120", "10130", "10131", "10132",
-    # Add your full restricted list here
-}
-
-# Environment variables (set in Render dashboard)
+# Configuration
+SSE_URL = os.getenv("SSE_URL", "https://stream.companieshouse.gov.uk/")
+API_KEY = os.getenv("API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-API_KEY = os.getenv("COMPANIES_HOUSE_STREAMING_API_KEY")
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "10"))
+RETRY_DELAY = int(os.getenv("RETRY_DELAY", "30"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+PORT = int(os.getenv("PORT", 8000))
 
-# Logging - INFO level for production
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# CLASSIFICATION LOGIC
-# ============================================================================
+# Target SIC Codes (all as strings for consistent comparison)
+TARGET_SIC_CODES = {
+    "62011", "62012", "62020", "62030", "62090",
+    "63110", "63120", "63910", "63990",
+    "64999", "66190", "66220", "66300",
+    "70229", "72110", "72190", "72200",
+    "73110", "73120", "73200",
+    "74100", "74200", "74300", "74900",
+    "82990", "85590", "86900", "87900",
+    "90030", "91010", "91020", "93290"
+}
 
-def matches_buzzword(company_name: str) -> bool:
-    """Check if company name contains target buzzwords."""
-    if not company_name:
-        return False
-    name_lower = company_name.lower()
-    return any(keyword in name_lower for keyword in TARGET_NAME_KEYWORDS)
+# Buzzword pattern - " AI" with space to avoid false positives
+BUZZWORD_PATTERNS = [" AI"]
+
+# Global state
+db_conn = None
+last_event_id = None
+shutdown_flag = False
+connected_clients = set()
+
+def get_db_connection():
+    """Get or create database connection."""
+    global db_conn
+    if db_conn is None:
+        db_conn = psycopg.connect(DATABASE_URL)
+    return db_conn
 
 def classify_company(sic_codes: list, company_name: str) -> Optional[str]:
     """
     Classify company based on SIC codes and name.
-    Returns: 'target_sic', 'buzzword', 'restricted_sic', or None
+    Returns: 'target_sic', 'buzzword', or None
     """
-    # Check target SIC codes
-    if sic_codes and any(str(sic) in TARGET_SIC_CODES for sic in sic_codes):
-        return "target_sic"
+    # Check target SIC codes FIRST
+    if sic_codes:
+        for sic in sic_codes:
+            if str(sic) in TARGET_SIC_CODES:
+                return "target_sic"
     
-    # Check buzzwords
+    # Check buzzwords SECOND - " AI" with space
     if matches_buzzword(company_name):
         return "buzzword"
     
-    # Check restricted SIC codes
-    if sic_codes and any(str(sic) in RESTRICTED_SIC_CODES for sic in sic_codes):
-        return "restricted_sic"
-    
+    # No match - don't insert
     return None
 
-# ============================================================================
-# DATABASE OPERATIONS
-# ============================================================================
+def matches_buzzword(company_name: str) -> bool:
+    """Check if company name contains buzzword patterns."""
+    if not company_name:
+        return False
+    
+    # Check for " AI" (space before AI)
+    for pattern in BUZZWORD_PATTERNS:
+        if pattern in company_name:
+            return True
+    
+    return False
 
-@contextmanager
-def get_db_cursor():
-    """Database connection context manager."""
-    conn = psycopg.connect(DATABASE_URL)
-    try:
-        cur = conn.cursor()
-        yield cur
-        conn.commit()
-    finally:
-        conn.close()
+@backoff.on_exception(
+    backoff.constant,
+    Exception,
+    max_tries=MAX_RETRIES,
+    interval=RETRY_DELAY,
+    logger=logger
+)
+def fetch_events(sse_client, last_id=None):
+    """Fetch events from SSE stream with retry logic."""
+    headers = {
+        "Authorization": f"Basic {API_KEY}",
+        "Accept": "application/json"
+    }
+    
+    if last_id:
+        headers["Last-Event-ID"] = last_id
+    
+    with httpx.stream("GET", SSE_URL, headers=headers, timeout=30.0) as response:
+        response.raise_for_status()
+        
+        for line in response.iter_lines():
+            if shutdown_flag:
+                return []
+            
+            if not line:
+                continue
+            
+            if line.startswith("event:"):
+                continue
+            
+            if line.startswith("id:"):
+                last_event_id = line[3:].strip()
+                continue
+            
+            if line.startswith("data:"):
+                try:
+                    data = json.loads(line[5:])
+                    yield data
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error: {e}")
+                    continue
 
-def get_checkpoint() -> int:
-    """Get last processed timepoint from database."""
+def process_event(event_data: dict) -> Optional[dict]:
+    """
+    Process a single event and return company data if it matches.
+    Only returns companies with target SIC codes or buzzword " AI".
+    """
     try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT timepoint FROM stream_state WHERE id = 1")
-            result = cur.fetchone()
-            return result[0] if result else 0
+        # Extract company data
+        company_data = event_data.get('data', {})
+        if not company_data or 'company_number' not in company_data:
+            return None
+        
+        company_number = company_data['company_number']
+        company_name = company_data.get('company_name', '')
+        incorporation_date = company_data.get('incorporation_date')
+        sic_codes = company_data.get('sic_codes', [])
+        
+        # Skip if no incorporation date
+        if not incorporation_date:
+            logger.info(f"Skipping {company_number} - no incorporation date")
+            return None
+        
+        # Get today's date dynamically (UTC)
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        
+        # Check if incorporated today
+        if incorporation_date != today:
+            logger.info(f"Skipping {company_number} - not incorporated today ({incorporation_date})")
+            return None
+        
+        # Classify the company
+        source_type = classify_company(sic_codes, company_name)
+        
+        if not source_type:
+            logger.info(f"Skipping {company_number} - no match (SIC: {sic_codes}, Name: {company_name})")
+            return None
+        
+        logger.info(f"✓ Match found: {company_number} - {source_type}")
+        
+        # Return company data with current timestamp
+        return {
+            "company_number": company_number,
+            "company_name": company_name,
+            "incorporation_date": today,  # Use today's date
+            "sic_codes": sic_codes,
+            "source_type": source_type,
+            "published_at": datetime.now(timezone.utc).isoformat()
+        }
+        
     except Exception as e:
-        logger.error(f"Error getting checkpoint: {e}")
-        return 0
+        logger.error(f"Error processing event: {e}")
+        return None
 
-def save_checkpoint(timepoint: int):
-    """Save checkpoint to database."""
+def insert_company(company_data: dict, source_type: str):
+    """Insert company into database."""
     try:
-        with get_db_cursor() as cur:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO stream_state (id, timepoint, updated_at)
-                VALUES (1, %s, NOW())
-                ON CONFLICT (id) DO UPDATE
-                SET timepoint = %s, updated_at = NOW()
-            """, (timepoint, timepoint))
+                INSERT INTO screened_companies 
+                (company_number, company_name, incorporation_date, sic_codes, source_type, published_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (company_number) DO NOTHING
+            """, (
+                company_data['company_number'],
+                company_data['company_name'],
+                company_data['incorporation_date'],
+                company_data['sic_codes'],
+                source_type,
+                company_data['published_at']
+            ))
+            conn.commit()
+        logger.info(f"Inserted {company_data['company_number']} - {source_type}")
+    except Exception as e:
+        logger.error(f"Error inserting company: {e}")
+        conn.rollback()
+
+async def broadcast_company(company_data: dict):
+    """Broadcast new company to all connected WebSocket clients."""
+    if not connected_clients:
+        return
+    
+    message = {
+        "type": "company",
+        "company": company_data
+    }
+    
+    disconnected = set()
+    for client in connected_clients:
+        try:
+            await client.send_json(message)
+        except Exception as e:
+            logger.error(f"Error sending to client: {e}")
+            disconnected.add(client)
+    
+    for client in disconnected:
+        connected_clients.remove(client)
+    
+    logger.info(f"Broadcasted {company_data['company_number']} to {len(connected_clients)} clients")
+
+def process_batch(batch: list):
+    """Process a batch of events."""
+    logger.info(f"Processing batch of {len(batch)} events")
+    
+    for event_data in batch:
+        if shutdown_flag:
+            break
+        
+        try:
+            # Process the event
+            company_data = process_event(event_data)
+            
+            if company_data:
+                # Insert into database
+                insert_company(company_data, company_data['source_type'])
+                
+                # Broadcast to dashboard
+                asyncio.run(broadcast_company(company_data))
+                
+        except Exception as e:
+            logger.error(f"Error processing event: {e}")
+            continue
+
+def save_checkpoint():
+    """Save last event ID to file."""
+    try:
+        with open('/tmp/last_event_id.txt', 'w') as f:
+            f.write(last_event_id or '')
+        logger.info(f"Saved checkpoint: {last_event_id}")
     except Exception as e:
         logger.error(f"Error saving checkpoint: {e}")
 
-def update_worker_status(status: str, last_error: Optional[str] = None):
-    """Update worker status in database."""
+def load_checkpoint():
+    """Load last event ID from file."""
     try:
-        with get_db_cursor() as cur:
-            cur.execute("""
-                INSERT INTO worker_status (id, status, last_connected_at, last_event_at, last_error, updated_at)
-                VALUES (1, %s, NOW(), %s, %s, NOW())
-                ON CONFLICT (id) DO UPDATE
-                SET status = %s, last_event_at = %s, last_error = %s, updated_at = NOW()
-            """, (status, datetime.now(), last_error, status, datetime.now(), last_error))
-    except Exception as e:
-        logger.error(f"Error updating worker status: {e}")
+        with open('/tmp/last_event_id.txt', 'r') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
 
-def insert_company(company_data: dict, source_type: str):
-    """Insert or update company in database with timing info."""
-    try:
-        start_time = time.time()
-        
-        with get_db_cursor() as cur:
-            cur.execute("""
-                INSERT INTO screened_companies (
-                    company_number, company_name, incorporation_date, company_status,
-                    sic_codes, company_url, screened_at, published_at, received_at,
-                    source_type, review_status
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, NOW(), %s, NOW(), %s, 'approved'
-                )
-                ON CONFLICT (company_number) DO UPDATE SET
-                    company_name = EXCLUDED.company_name,
-                    company_status = EXCLUDED.company_status,
-                    sic_codes = EXCLUDED.sic_codes,
-                    screened_at = NOW(),
-                    published_at = EXCLUDED.published_at,
-                    received_at = NOW(),
-                    source_type = EXCLUDED.source_type
-                WHERE screened_companies.incorporation_date = %s
-            """, (
-                company_data["company_number"],
-                company_data["company_name"],
-                company_data["incorporation_date"],
-                company_data.get("company_status", "active"),
-                json.dumps(company_data["sic_codes"]),
-                f"https://find-and-update.company-information.service.gov.uk/company/{company_data['company_number']}",
-                company_data["published_at"],
-                source_type,
-                company_data["incorporation_date"]
-            ))
-            
-        insert_time = time.time() - start_time
-        logger.info(f"✅ INSERTED {company_data['company_number']} as {source_type} (DB: {insert_time:.2f}s)")
-        
-    except Exception as e:
-        logger.error(f"❌ Error inserting company: {e}")
+def signal_handler(signum, frame):
+    """Handle shutdown signals."""
+    global shutdown_flag
+    logger.info("Shutdown signal received")
+    shutdown_flag = True
 
-# ============================================================================
-# EVENT PROCESSING - OPTIMIZED
-# ============================================================================
-
-def process_event(event: dict):
-    """Process a single streaming event with timing."""
-    try:
-        start_time = time.time()
-        
-        # Check if it's a company-profile event
-        if event.get("resource_kind") != "company-profile":
-            return
-        
-        # Extract data from nested structure
-        data = event.get("data", {})
-        if not data:
-            return
-        
-        # Extract company number
-        company_number = data.get("company_number")
-        if not company_number:
-            return
-        
-        # Extract fields from data
-        company_name = data.get("company_name", "")
-        date_of_creation = data.get("date_of_creation")
-        sic_codes = data.get("sic_codes", [])
-        company_status = data.get("company_status", "active")
-        
-        # Extract event metadata
-        event_info = event.get("event", {})
-        published_at = event_info.get("published_at")
-        timepoint = event_info.get("timepoint")
-        
-        # Only process companies incorporated today
-        today = date.today().isoformat()
-        
-        if not date_of_creation:
-            return
-        
-        if date_of_creation != today:
-            return
-        
-        # Ensure sic_codes is a list
-        if isinstance(sic_codes, str):
-            try:
-                sic_codes = json.loads(sic_codes)
-            except:
-                sic_codes = [sic_codes]
-        
-        if not sic_codes:
-            return
-        
-        # Classify the company
-        source_type = classify_company(sic_codes, company_name)
-        if not source_type:
-            return
-        
-        # Insert into database
-        company_data = {
-            "company_number": company_number,
-            "company_name": company_name,
-            "incorporation_date": date_of_creation,
-            "company_status": company_status,
-            "sic_codes": sic_codes,
-            "published_at": published_at
-        }
-        
-        insert_company(company_data, source_type)
-        
-        # Calculate total processing time
-        total_time = time.time() - start_time
-        logger.info(f"⏱️ Total processing time: {total_time:.3f}s")
-        
-        # Update status
-        update_worker_status("connected")
-        
-        # Save checkpoint
-        if timepoint:
-            save_checkpoint(timepoint)
-            
-    except Exception as e:
-        logger.error(f"❌ Error processing event: {e}")
-        update_worker_status("error", str(e))
-
-# ============================================================================
-# MAIN WORKER LOOP
-# ============================================================================
-
-def run_worker():
-    """Main worker loop - runs indefinitely."""
-    logger.info("🚀 Starting Companies House worker...")
-    update_worker_status("starting")
+def main():
+    """Main worker loop."""
+    global last_event_id
     
-    while True:
-        try:
-            # Get checkpoint
-            checkpoint = get_checkpoint()
-            update_worker_status("connecting")
-            
-            # Connect to stream
-            url = "https://stream.companieshouse.gov.uk/companies"
-            headers = {"Authorization": API_KEY}
-            params = {"timepoint": checkpoint} if checkpoint else {}
-            
-            logger.info(f"🔗 Connecting to Companies House stream (checkpoint: {checkpoint})")
-            
-            with requests.get(url, headers=headers, params=params, stream=True, timeout=30) as response:
-                response.raise_for_status()
-                update_worker_status("connected")
-                logger.info("✅ Connected to Companies House stream")
-                
-                event_count = 0
-                companies_found = 0
-                
-                for line in response.iter_lines():
-                    try:
-                        event = json.loads(line)
-                        event_count += 1
-                        
-                        # Log progress every 100 events
-                        if event_count % 100 == 0:
-                            logger.info(f"📊 Processed {event_count} events, found {companies_found} companies")
-                        
-                        # Check if this event resulted in a company being inserted
-                        if process_event_with_count(event):
-                            companies_found += 1
-                        
-                    except json.JSONDecodeError as e:
-                        logger.error(f"❌ JSON decode error: {e}")
-                        continue
-                        
-        except Exception as e:
-            error_msg = f"Stream error: {e}"
-            logger.error(f"❌ {error_msg}")
-            update_worker_status("error", error_msg)
-            logger.info("⏳ Reconnecting in 10 seconds...")
-            time.sleep(10)
-
-def process_event_with_count(event: dict) -> bool:
-    """Process event and return True if company was inserted."""
-    try:
-        # Check if it's a company-profile event
-        if event.get("resource_kind") != "company-profile":
-            return False
+    # Set up signal handlers
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    logger.info("Starting Companies House Worker")
+    logger.info(f"Target SIC codes: {len(TARGET_SIC_CODES)}")
+    logger.info(f"Buzzword patterns: {BUZZWORD_PATTERNS}")
+    
+    # Load checkpoint
+    last_event_id = load_checkpoint()
+    if last_event_id:
+        logger.info(f"Resuming from event ID: {last_event_id}")
+    
+    # Initialize SSE client
+    with httpx.Client() as sse_client:
+        batch = []
         
-        # Extract data from nested structure
-        data = event.get("data", {})
-        if not data:
-            return False
-        
-        # Extract company number
-        company_number = data.get("company_number")
-        if not company_number:
-            return False
-        
-        # Extract fields from data
-        company_name = data.get("company_name", "")
-        date_of_creation = data.get("date_of_creation")
-        sic_codes = data.get("sic_codes", [])
-        company_status = data.get("company_status", "active")
-        
-        # Extract event metadata
-        event_info = event.get("event", {})
-        published_at = event_info.get("published_at")
-        timepoint = event_info.get("timepoint")
-        
-        # Only process companies incorporated today
-        today = date.today().isoformat()
-        
-        if not date_of_creation:
-            return False
-        
-        if date_of_creation != today:
-            return False
-        
-        # Ensure sic_codes is a list
-        if isinstance(sic_codes, str):
+        while not shutdown_flag:
             try:
-                sic_codes = json.loads(sic_codes)
-            except:
-                sic_codes = [sic_codes]
-        
-        if not sic_codes:
-            return False
-        
-        # Classify the company
-        source_type = classify_company(sic_codes, company_name)
-        if not source_type:
-            return False
-        
-        # Log timing info
-        if published_at:
-            try:
-                published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-                delay = datetime.now(published.tzinfo) - published
-                logger.info(f"⏱️ Delay from CH publication: {delay.total_seconds():.1f}s")
-            except:
-                pass
-        
-        # Insert into database
-        company_data = {
-            "company_number": company_number,
-            "company_name": company_name,
-            "incorporation_date": date_of_creation,
-            "company_status": company_status,
-            "sic_codes": sic_codes,
-            "published_at": published_at
-        }
-        
-        insert_company(company_data, source_type)
-        
-        # Update status
-        update_worker_status("connected")
-        
-        # Save checkpoint
-        if timepoint:
-            save_checkpoint(timepoint)
-        
-        return True
-            
-    except Exception as e:
-        logger.error(f"❌ Error processing event: {e}")
-        update_worker_status("error", str(e))
-        return False
+                # Fetch events from SSE stream
+                for event_data in fetch_events(sse_client, last_event_id):
+                    if shutdown_flag:
+                        break
+                    
+                    batch.append(event_data)
+                    
+                    # Process batch when it reaches the size limit
+                    if len(batch) >= BATCH_SIZE:
+                        process_batch(batch)
+                        batch = []
+                
+                # Save checkpoint periodically
+                if last_event_id:
+                    save_checkpoint()
+                    
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                if not shutdown_flag:
+                    logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                    asyncio.sleep(RETRY_DELAY)
+    
+    # Process remaining events
+    if batch:
+        logger.info(f"Processing remaining {len(batch)} events")
+        process_batch(batch)
+    
+    logger.info("Worker shutdown complete")
 
 if __name__ == "__main__":
-    if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL environment variable not set")
-        exit(1)
-    
-    if not API_KEY:
-        logger.error("❌ COMPANIES_HOUSE_STREAMING_API_KEY environment variable not set")
-        exit(1)
-    
-    logger.info("✅ All environment variables present")
-    run_worker()
+    main()
