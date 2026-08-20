@@ -1,6 +1,6 @@
 """
-Companies House Real-Time Worker - FIXED DATE
-Always uses current date (not hardcoded)
+Companies House Real-Time Worker - OPTIMIZED
+<10 second delay from event to dashboard
 """
 
 import asyncio
@@ -15,6 +15,7 @@ import httpx
 import psycopg
 from psycopg import sql
 import backoff
+from concurrent.futures import ThreadPoolExecutor
 
 # Configuration
 SSE_URL = os.getenv("SSE_URL", "https://stream.companieshouse.gov.uk/")
@@ -22,14 +23,13 @@ API_KEY = os.getenv("API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "10"))
 RETRY_DELAY = int(os.getenv("RETRY_DELAY", "30"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 PORT = int(os.getenv("PORT", 8000))
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Target SIC Codes (all as strings for consistent comparison)
+# Target SIC Codes
 TARGET_SIC_CODES = {
     "62011", "62012", "62020", "62030", "62090",
     "63110", "63120", "63910", "63990",
@@ -41,14 +41,11 @@ TARGET_SIC_CODES = {
     "90030", "91010", "91020", "93290"
 }
 
-# Buzzword pattern - " AI" with space to avoid false positives
-BUZZWORD_PATTERNS = [" AI"]
-
 # Global state
 db_conn = None
 last_event_id = None
 shutdown_flag = False
-connected_clients = set()
+executor = ThreadPoolExecutor(max_workers=5)  # Async DB inserts
 
 def get_db_connection():
     """Get or create database connection."""
@@ -58,34 +55,14 @@ def get_db_connection():
     return db_conn
 
 def classify_company(sic_codes: list, company_name: str) -> Optional[str]:
-    """
-    Classify company based on SIC codes and name.
-    Returns: 'target_sic', 'buzzword', or None
-    """
-    # Check target SIC codes FIRST
+    """Classify company based on SIC codes only (optimized)."""
+    # Check target SIC codes
     if sic_codes:
         for sic in sic_codes:
             if str(sic) in TARGET_SIC_CODES:
                 return "target_sic"
     
-    # Check buzzwords SECOND - " AI" with space
-    if matches_buzzword(company_name):
-        return "buzzword"
-    
-    # No match - don't insert
     return None
-
-def matches_buzzword(company_name: str) -> bool:
-    """Check if company name contains buzzword patterns."""
-    if not company_name:
-        return False
-    
-    # Check for " AI" (space before AI)
-    for pattern in BUZZWORD_PATTERNS:
-        if pattern in company_name:
-            return True
-    
-    return False
 
 @backoff.on_exception(
     backoff.constant,
@@ -95,7 +72,7 @@ def matches_buzzword(company_name: str) -> bool:
     logger=logger
 )
 def fetch_events(sse_client, last_id=None):
-    """Fetch events from SSE stream with retry logic."""
+    """Fetch events from SSE stream."""
     headers = {
         "Authorization": f"Basic {API_KEY}",
         "Accept": "application/json"
@@ -114,9 +91,6 @@ def fetch_events(sse_client, last_id=None):
             if not line:
                 continue
             
-            if line.startswith("event:"):
-                continue
-            
             if line.startswith("id:"):
                 last_event_id = line[3:].strip()
                 continue
@@ -130,12 +104,8 @@ def fetch_events(sse_client, last_id=None):
                     continue
 
 def process_event(event_data: dict) -> Optional[dict]:
-    """
-    Process a single event and return company data if it matches.
-    Only returns companies with target SIC codes or buzzword " AI".
-    """
+    """Process a single event and return company data if it matches."""
     try:
-        # Extract company data
         company_data = event_data.get('data', {})
         if not company_data or 'company_number' not in company_data:
             return None
@@ -145,33 +115,28 @@ def process_event(event_data: dict) -> Optional[dict]:
         incorporation_date = company_data.get('incorporation_date')
         sic_codes = company_data.get('sic_codes', [])
         
-        # Skip if no incorporation date
         if not incorporation_date:
-            logger.info(f"Skipping {company_number} - no incorporation date")
             return None
         
-        # Get today's date dynamically (UTC)
+        # Get today's date (UTC)
         today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         
         # Check if incorporated today
         if incorporation_date != today:
-            logger.info(f"Skipping {company_number} - not incorporated today ({incorporation_date})")
             return None
         
         # Classify the company
         source_type = classify_company(sic_codes, company_name)
         
         if not source_type:
-            logger.info(f"Skipping {company_number} - no match (SIC: {sic_codes}, Name: {company_name})")
             return None
         
-        logger.info(f"✓ Match found: {company_number} - {source_type}")
+        logger.info(f"✓ Match: {company_number} - {source_type}")
         
-        # Return company data with current timestamp
         return {
             "company_number": company_number,
             "company_name": company_name,
-            "incorporation_date": today,  # Use today's date
+            "incorporation_date": today,
             "sic_codes": sic_codes,
             "source_type": source_type,
             "published_at": datetime.now(timezone.utc).isoformat()
@@ -181,8 +146,8 @@ def process_event(event_data: dict) -> Optional[dict]:
         logger.error(f"Error processing event: {e}")
         return None
 
-def insert_company(company_data: dict, source_type: str):
-    """Insert company into database."""
+def insert_company_sync(company_data: dict, source_type: str):
+    """Insert company into database (sync, for thread pool)."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -200,14 +165,19 @@ def insert_company(company_data: dict, source_type: str):
                 company_data['published_at']
             ))
             conn.commit()
-        logger.info(f"Inserted {company_data['company_number']} - {source_type}")
+        logger.info(f"✓ Inserted {company_data['company_number']}")
     except Exception as e:
-        logger.error(f"Error inserting company: {e}")
+        logger.error(f"Error inserting: {e}")
         conn.rollback()
 
-async def broadcast_company(company_data: dict):
+async def insert_company_async(company_data: dict, source_type: str):
+    """Insert company into database asynchronously."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, insert_company_sync, company_data, source_type)
+
+async def broadcast_company(company_data: dict, clients: Set):
     """Broadcast new company to all connected WebSocket clients."""
-    if not connected_clients:
+    if not clients:
         return
     
     message = {
@@ -216,7 +186,7 @@ async def broadcast_company(company_data: dict):
     }
     
     disconnected = set()
-    for client in connected_clients:
+    for client in clients:
         try:
             await client.send_json(message)
         except Exception as e:
@@ -224,39 +194,13 @@ async def broadcast_company(company_data: dict):
             disconnected.add(client)
     
     for client in disconnected:
-        connected_clients.remove(client)
-    
-    logger.info(f"Broadcasted {company_data['company_number']} to {len(connected_clients)} clients")
-
-def process_batch(batch: list):
-    """Process a batch of events."""
-    logger.info(f"Processing batch of {len(batch)} events")
-    
-    for event_data in batch:
-        if shutdown_flag:
-            break
-        
-        try:
-            # Process the event
-            company_data = process_event(event_data)
-            
-            if company_data:
-                # Insert into database
-                insert_company(company_data, company_data['source_type'])
-                
-                # Broadcast to dashboard
-                asyncio.run(broadcast_company(company_data))
-                
-        except Exception as e:
-            logger.error(f"Error processing event: {e}")
-            continue
+        clients.remove(client)
 
 def save_checkpoint():
     """Save last event ID to file."""
     try:
         with open('/tmp/last_event_id.txt', 'w') as f:
             f.write(last_event_id or '')
-        logger.info(f"Saved checkpoint: {last_event_id}")
     except Exception as e:
         logger.error(f"Error saving checkpoint: {e}")
 
@@ -274,42 +218,62 @@ def signal_handler(signum, frame):
     logger.info("Shutdown signal received")
     shutdown_flag = True
 
+async def process_event_async(event_data: dict, clients: Set):
+    """Process event asynchronously with non-blocking DB insert."""
+    try:
+        # Process the event (fast, synchronous)
+        company_data = process_event(event_data)
+        
+        if company_data:
+            # Insert to database asynchronously (non-blocking)
+            asyncio.create_task(insert_company_async(company_data, company_data['source_type']))
+            
+            # Broadcast immediately (don't wait for DB)
+            await broadcast_company(company_data, clients)
+            
+    except Exception as e:
+        logger.error(f"Error processing event: {e}")
+
 def main():
-    """Main worker loop."""
+    """Main worker loop - OPTIMIZED."""
     global last_event_id
     
-    # Set up signal handlers
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     
-    logger.info("Starting Companies House Worker")
+    logger.info("=" * 60)
+    logger.info("Starting Companies House Worker - OPTIMIZED")
+    logger.info("Target: <10 second delay")
+    logger.info("=" * 60)
     logger.info(f"Target SIC codes: {len(TARGET_SIC_CODES)}")
-    logger.info(f"Buzzword patterns: {BUZZWORD_PATTERNS}")
+    logger.info(f"SSE URL: {SSE_URL}")
     
-    # Load checkpoint
     last_event_id = load_checkpoint()
     if last_event_id:
         logger.info(f"Resuming from event ID: {last_event_id}")
     
-    # Initialize SSE client
+    # Create event loop for async operations
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Shared clients set (will be populated by dashboard)
+    clients = set()
+    
     with httpx.Client() as sse_client:
-        batch = []
+        event_count = 0
         
         while not shutdown_flag:
             try:
-                # Fetch events from SSE stream
                 for event_data in fetch_events(sse_client, last_event_id):
                     if shutdown_flag:
                         break
                     
-                    batch.append(event_data)
+                    event_count += 1
                     
-                    # Process batch when it reaches the size limit
-                    if len(batch) >= BATCH_SIZE:
-                        process_batch(batch)
-                        batch = []
+                    # Process event immediately (no batching)
+                    loop.run_until_complete(process_event_async(event_data, clients))
                 
-                # Save checkpoint periodically
+                # Save checkpoint
                 if last_event_id:
                     save_checkpoint()
                     
@@ -317,14 +281,14 @@ def main():
                 logger.error(f"Error in main loop: {e}")
                 if not shutdown_flag:
                     logger.info(f"Retrying in {RETRY_DELAY} seconds...")
-                    asyncio.sleep(RETRY_DELAY)
+                    time.sleep(RETRY_DELAY)
     
-    # Process remaining events
-    if batch:
-        logger.info(f"Processing remaining {len(batch)} events")
-        process_batch(batch)
+    # Cleanup
+    loop.close()
+    executor.shutdown(wait=True)
     
     logger.info("Worker shutdown complete")
 
 if __name__ == "__main__":
+    import time
     main()
