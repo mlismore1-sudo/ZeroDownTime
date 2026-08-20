@@ -238,12 +238,20 @@ def fetch_and_process_events():
     """Fetch events from SSE stream (runs in background thread)."""
     global last_event_id, shutdown_flag
     
+    logger.info("=" * 60)
     logger.info("Starting SSE stream processor...")
+    logger.info(f"API Key configured: {bool(API_KEY)}")
+    logger.info(f"SSE URL: {SSE_URL}")
+    logger.info("=" * 60)
     
-    headers = {
-        "Authorization": f"Basic {API_KEY}",
-        "Accept": "application/json"
-    }
+    if not API_KEY:
+        logger.error("❌ API_KEY environment variable NOT set!")
+        logger.error("Please set API_KEY in Render dashboard:")
+        logger.error("1. Go to your service")
+        logger.error("2. Click 'Environment' tab")
+        logger.error("3. Add variable: API_KEY = your-actual-api-key")
+        logger.error("4. Service will auto-redeploy")
+        return
     
     retry_count = 0
     max_retries = 10
@@ -251,52 +259,89 @@ def fetch_and_process_events():
     
     while not shutdown_flag:
         try:
+            headers = {
+                "Accept": "application/json"
+            }
+            
             if last_event_id:
                 headers["Last-Event-ID"] = last_event_id
             
-            with httpx.stream("GET", SSE_URL, headers=headers, timeout=30.0) as response:
-                response.raise_for_status()
-                logger.info("✓ Connected to SSE stream")
-                retry_count = 0
-                
-                for line in response.iter_lines():
-                    if shutdown_flag:
-                        break
-                    
-                    if not line:
-                        continue
-                    
-                    if line.startswith("id:"):
-                        last_event_id = line[3:].strip()
-                        continue
-                    
-                    if line.startswith("data:"):
-                        try:
-                            event_data = json.loads(line[5:])
-                            company_data = process_event(event_data)
-                            
-                            if company_data:
-                                # Insert to database
-                                insert_company(company_data, company_data['source_type'])
-                                
-                                # Broadcast to dashboard
-                                asyncio.run(broadcast_company(company_data))
-                                
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON error: {e}")
-                            continue
+            logger.info(f"Connecting to Companies House SSE stream...")
             
-        except Exception as e:
-            logger.error(f"SSE stream error: {e}")
+            # Use httpx with basic auth (API key as username, empty password)
+            with httpx.Client(auth=(API_KEY, "")) as client:
+                with client.stream("GET", SSE_URL, headers=headers, timeout=30.0) as response:
+                    logger.info(f"SSE response status: {response.status_code}")
+                    response.raise_for_status()
+                    logger.info("✓ Connected to SSE stream successfully!")
+                    retry_count = 0
+                    
+                    for line in response.iter_lines():
+                        if shutdown_flag:
+                            break
+                        
+                        if not line:
+                            continue
+                        
+                        if line.startswith("id:"):
+                            last_event_id = line[3:].strip()
+                            continue
+                        
+                        if line.startswith("data:"):
+                            try:
+                                event_data = json.loads(line[5:])
+                                company_data = process_event(event_data)
+                                
+                                if company_data:
+                                    # Insert to database
+                                    insert_company(company_data, company_data['source_type'])
+                                    
+                                    # Broadcast to dashboard
+                                    asyncio.run(broadcast_company(company_data))
+                                    
+                            except json.JSONDecodeError as e:
+                                logger.error(f"JSON error: {e}")
+                                continue
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ HTTP Error: {e.response.status_code}")
+            logger.error(f"Response: {e.response.text[:500]}")
+            
+            if e.response.status_code == 401:
+                logger.error("❌ Authentication failed (401)")
+                logger.error("Check that API_KEY is correct in Render environment")
+            elif e.response.status_code == 400:
+                logger.error("❌ Bad request (400)")
+                logger.error("API key may be invalid or malformed")
+            elif e.response.status_code == 403:
+                logger.error("❌ Forbidden (403)")
+                logger.error("API key may be expired or revoked")
+            
             retry_count += 1
             
             if retry_count >= max_retries:
-                logger.error(f"Max retries ({max_retries}) reached")
+                logger.error(f"❌ Max retries ({max_retries}) reached. Giving up.")
+                return
             
             if not shutdown_flag:
                 logger.info(f"Retrying in {retry_delay}s... (attempt {retry_count}/{max_retries})")
                 import time
                 time.sleep(retry_delay)
+                
+        except Exception as e:
+            logger.error(f"❌ SSE stream error: {e}")
+            retry_count += 1
+            
+            if retry_count >= max_retries:
+                logger.error(f"❌ Max retries ({max_retries}) reached. Giving up.")
+                return
+            
+            if not shutdown_flag:
+                logger.info(f"Retrying in {retry_delay}s... (attempt {retry_count}/{max_retries})")
+                import time
+                time.sleep(retry_delay)
+    
+    logger.info("SSE processor shutdown complete")
 
 # ============================================================================
 # HTML DASHBOARD
