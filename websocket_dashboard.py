@@ -1,6 +1,6 @@
 """
-Companies House Real-Time Dashboard - SORTED BY TIME
-Most recent results at the top (lowest time ago)
+Companies House Real-Time Dashboard - FIXED DATE
+Always shows today's companies (dynamic date)
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import psycopg
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from typing import Set
 import logging
@@ -48,7 +48,7 @@ def get_db_connection():
     return db_conn
 
 # ============================================================================
-# HTML FRONTEND - SORTED BY TIME
+# HTML FRONTEND - FIXED DATE
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -749,11 +749,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/metrics")
 async def get_metrics():
-    """Get current metrics from database."""
+    """Get current metrics from database - uses dynamic UTC date."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            today = datetime.now().date().isoformat()
+            # Get today's date dynamically (UTC)
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             
             cur.execute("""
                 SELECT COUNT(*) FROM screened_companies 
@@ -775,6 +776,8 @@ async def get_metrics():
             """, (today,))
             total_count = cur.fetchone()[0]
             
+            logger.info(f"Metrics for {today}: target={target_count}, restricted={restricted_count}, total={total_count}")
+            
             return {
                 "target_count": target_count,
                 "restricted_count": restricted_count,
@@ -790,18 +793,27 @@ async def get_companies(limit: int = 100):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
+            # Get today's date dynamically (UTC)
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            
+            logger.info(f"Fetching companies for {today}")
+            
             cur.execute("""
                 SELECT company_number, company_name, incorporation_date, 
                        sic_codes, source_type, published_at
                 FROM screened_companies
-                WHERE incorporation_date = CURRENT_DATE
+                WHERE incorporation_date = %s
                 ORDER BY published_at DESC
                 LIMIT %s
-            """, (limit,))
+            """, (today, limit,))
             
             rows = cur.fetchall()
             columns = [desc[0] for desc in cur.description]
-            return [dict(zip(columns, row)) for row in rows]
+            result = [dict(zip(columns, row)) for row in rows]
+            
+            logger.info(f"Found {len(result)} companies for {today}")
+            
+            return result
     except Exception as e:
         logger.error(f"Error getting companies: {e}")
         return []
