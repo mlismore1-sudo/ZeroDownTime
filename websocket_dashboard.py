@@ -1,6 +1,6 @@
 """
-Companies House Real-Time Dashboard - FIXED DATE
-Always shows today's companies (dynamic date)
+Companies House Real-Time Dashboard - OPTIMIZED
+<10 second delay from event to dashboard
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -48,7 +48,7 @@ def get_db_connection():
     return db_conn
 
 # ============================================================================
-# HTML FRONTEND - FIXED DATE
+# HTML FRONTEND - OPTIMIZED
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -517,14 +517,12 @@ async def get_dashboard():
             ws = new WebSocket(wsUrl);
             
             ws.onopen = function() {
-                console.log('WebSocket connected');
                 updateStatus(true);
                 reconnectAttempts = 0;
                 fetchInitialData();
             };
             
             ws.onclose = function() {
-                console.log('WebSocket disconnected');
                 updateStatus(false);
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
                 reconnectAttempts++;
@@ -532,13 +530,11 @@ async def get_dashboard():
             };
             
             ws.onerror = function(error) {
-                console.error('WebSocket error:', error);
                 updateStatus(false);
             };
             
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
-                console.log('Received:', data);
                 
                 if (data.type === 'company') {
                     addCompany(data.company);
@@ -557,7 +553,6 @@ async def get_dashboard():
                 const companiesRes = await fetch('/api/companies?limit=100');
                 const companiesData = await companiesRes.json();
                 
-                console.log('Initial companies:', companiesData.length);
                 companies = companiesData;
                 renderCompanies();
             } catch (error) {
@@ -566,30 +561,19 @@ async def get_dashboard():
         }
         
         function addCompany(company) {
-            // Check if company already exists
             const exists = companies.some(c => c.company_number === company.company_number);
-            if (exists) {
-                console.log('Company already exists:', company.company_number);
-                return;
-            }
+            if (exists) return;
             
-            // Add to array
             companies.push(company);
             if (companies.length > 100) companies = companies.slice(0, 100);
             
-            // Sort by published_at (most recent first)
             companies.sort((a, b) => {
                 const timeA = new Date(a.published_at || 0);
                 const timeB = new Date(b.published_at || 0);
-                return timeB - timeA; // Descending (most recent first)
+                return timeB - timeA;
             });
             
-            console.log('New company added, total:', companies.length);
-            
-            // Re-render table
             renderCompanies();
-            
-            // Update metrics
             fetch('/api/metrics').then(res => res.json()).then(updateMetrics);
         }
         
@@ -645,21 +629,16 @@ async def get_dashboard():
                     </td>
                 </tr>
             `).join('');
-            
-            console.log('Table rendered with', companies.length, 'companies');
         }
         
         function copyToClipboard(text, btn) {
             navigator.clipboard.writeText(text).then(() => {
-                // Show visual feedback
                 btn.classList.add('copied');
                 btn.innerHTML = '✓';
                 
-                // Show toast
                 const toast = document.getElementById('toast');
                 toast.classList.add('show');
                 
-                // Reset after 2 seconds
                 setTimeout(() => {
                     btn.classList.remove('copied');
                     btn.innerHTML = `
@@ -695,7 +674,6 @@ async def get_dashboard():
             } catch { return 'N/A'; }
         }
         
-        // Auto-refresh metrics every 5 seconds
         setInterval(() => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 fetch('/api/metrics').then(res => res.json()).then(updateMetrics);
@@ -718,7 +696,7 @@ async def websocket_endpoint(websocket: WebSocket):
     """Handle WebSocket connections."""
     await websocket.accept()
     connected_clients.add(websocket)
-    logger.info(f"Client connected. Total clients: {len(connected_clients)}")
+    logger.info(f"✓ Client connected. Total: {len(connected_clients)}")
     
     try:
         metrics = await get_metrics()
@@ -738,10 +716,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 
     except WebSocketDisconnect:
         connected_clients.remove(websocket)
-        logger.info(f"Client disconnected. Total clients: {len(connected_clients)}")
+        logger.info(f"✗ Client disconnected. Total: {len(connected_clients)}")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-        connected_clients.remove(websocket)
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
 
 # ============================================================================
 # API ENDPOINTS
@@ -749,11 +728,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/metrics")
 async def get_metrics():
-    """Get current metrics from database - uses dynamic UTC date."""
+    """Get current metrics from database."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # Get today's date dynamically (UTC)
             today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
             
             cur.execute("""
@@ -776,8 +754,6 @@ async def get_metrics():
             """, (today,))
             total_count = cur.fetchone()[0]
             
-            logger.info(f"Metrics for {today}: target={target_count}, restricted={restricted_count}, total={total_count}")
-            
             return {
                 "target_count": target_count,
                 "restricted_count": restricted_count,
@@ -789,14 +765,11 @@ async def get_metrics():
 
 @app.get("/api/companies")
 async def get_companies(limit: int = 100):
-    """Get today's companies - sorted by published_at DESC (most recent first)."""
+    """Get today's companies."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # Get today's date dynamically (UTC)
             today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-            
-            logger.info(f"Fetching companies for {today}")
             
             cur.execute("""
                 SELECT company_number, company_name, incorporation_date, 
@@ -809,11 +782,7 @@ async def get_companies(limit: int = 100):
             
             rows = cur.fetchall()
             columns = [desc[0] for desc in cur.description]
-            result = [dict(zip(columns, row)) for row in rows]
-            
-            logger.info(f"Found {len(result)} companies for {today}")
-            
-            return result
+            return [dict(zip(columns, row)) for row in rows]
     except Exception as e:
         logger.error(f"Error getting companies: {e}")
         return []
@@ -825,7 +794,6 @@ async def get_companies(limit: int = 100):
 async def broadcast_company(company_data: dict):
     """Broadcast new company to all connected WebSocket clients."""
     if not connected_clients:
-        logger.info(f"No clients connected, skipping broadcast")
         return
     
     message = {
@@ -837,15 +805,12 @@ async def broadcast_company(company_data: dict):
     for client in connected_clients:
         try:
             await client.send_json(message)
-            logger.info(f"Broadcasted {company_data['company_number']} to client")
         except Exception as e:
             logger.error(f"Error sending to client: {e}")
             disconnected.add(client)
     
     for client in disconnected:
         connected_clients.remove(client)
-    
-    logger.info(f"Broadcasted company {company_data['company_number']} to {len(connected_clients)} clients")
 
 # ============================================================================
 # MAIN
@@ -853,5 +818,8 @@ async def broadcast_company(company_data: dict):
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Companies House Dashboard on port {PORT}")
+    logger.info("=" * 60)
+    logger.info("Starting Companies House Dashboard - OPTIMIZED")
+    logger.info("Target: <10 second delay")
+    logger.info("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=PORT)
