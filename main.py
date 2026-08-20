@@ -1,6 +1,6 @@
 """
 Companies House Real-Time Monitor - Render Version
-Single app with SQLite, no external database needed
+Fixed: Proper Companies House SSE streaming API
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Set, Optional
 import logging
 import threading
+import base64
 
 # Configuration
 SSE_URL = os.getenv("SSE_URL", "https://stream.companieshouse.gov.uk/")
@@ -235,23 +236,27 @@ async def broadcast_company(company_data: dict):
         connected_clients.remove(client)
 
 def fetch_and_process_events():
-    """Fetch events from SSE stream (runs in background thread)."""
+    """Fetch events from Companies House SSE stream."""
     global last_event_id, shutdown_flag
     
     logger.info("=" * 60)
     logger.info("Starting SSE stream processor...")
     logger.info(f"API Key configured: {bool(API_KEY)}")
+    logger.info(f"API Key length: {len(API_KEY) if API_KEY else 0}")
     logger.info(f"SSE URL: {SSE_URL}")
     logger.info("=" * 60)
     
     if not API_KEY:
-        logger.error("❌ API_KEY environment variable NOT set!")
-        logger.error("Please set API_KEY in Render dashboard:")
-        logger.error("1. Go to your service")
-        logger.error("2. Click 'Environment' tab")
-        logger.error("3. Add variable: API_KEY = your-actual-api-key")
-        logger.error("4. Service will auto-redeploy")
+        logger.error("❌ API_KEY not set!")
+        logger.error("Set in Render: Environment → API_KEY")
         return
+    
+    # Create Basic Auth header manually
+    auth_string = f"{API_KEY}:"
+    auth_bytes = base64.b64encode(auth_string.encode()).decode('utf-8')
+    auth_header = f"Basic {auth_bytes}"
+    
+    logger.info(f"Using Basic Auth header: {auth_header[:20]}...")
     
     retry_count = 0
     max_retries = 10
@@ -260,20 +265,27 @@ def fetch_and_process_events():
     while not shutdown_flag:
         try:
             headers = {
-                "Accept": "application/json"
+                "Accept": "application/json",
+                "Authorization": auth_header
             }
             
             if last_event_id:
                 headers["Last-Event-ID"] = last_event_id
             
-            logger.info(f"Connecting to Companies House SSE stream...")
+            logger.info(f"Connecting to {SSE_URL}...")
             
-            # Use httpx with basic auth (API key as username, empty password)
-            with httpx.Client(auth=(API_KEY, "")) as client:
+            with httpx.Client() as client:
                 with client.stream("GET", SSE_URL, headers=headers, timeout=30.0) as response:
-                    logger.info(f"SSE response status: {response.status_code}")
+                    logger.info(f"Response status: {response.status_code}")
+                    
+                    if response.status_code == 400:
+                        logger.error("❌ 400 Bad Request")
+                        logger.error("API key may be invalid or streaming not enabled")
+                        logger.error("Check: https://developer.company-information.service.gov.uk/")
+                        raise httpx.HTTPStatusError("400 Bad Request", request=response.request, response=response)
+                    
                     response.raise_for_status()
-                    logger.info("✓ Connected to SSE stream successfully!")
+                    logger.info("✓ Connected successfully!")
                     retry_count = 0
                     
                     for line in response.iter_lines():
@@ -293,10 +305,7 @@ def fetch_and_process_events():
                                 company_data = process_event(event_data)
                                 
                                 if company_data:
-                                    # Insert to database
                                     insert_company(company_data, company_data['source_type'])
-                                    
-                                    # Broadcast to dashboard
                                     asyncio.run(broadcast_company(company_data))
                                     
                             except json.JSONDecodeError as e:
@@ -305,46 +314,41 @@ def fetch_and_process_events():
             
         except httpx.HTTPStatusError as e:
             logger.error(f"❌ HTTP Error: {e.response.status_code}")
-            logger.error(f"Response: {e.response.text[:500]}")
             
-            if e.response.status_code == 401:
-                logger.error("❌ Authentication failed (401)")
-                logger.error("Check that API_KEY is correct in Render environment")
-            elif e.response.status_code == 400:
-                logger.error("❌ Bad request (400)")
-                logger.error("API key may be invalid or malformed")
-            elif e.response.status_code == 403:
-                logger.error("❌ Forbidden (403)")
-                logger.error("API key may be expired or revoked")
-            
-            retry_count += 1
+            if e.response.status_code in [400, 401, 403]:
+                logger.error("❌ Authentication/Authorization failed")
+                logger.error("Check API_KEY in Render Environment")
+                logger.error("Ensure streaming is enabled on your Companies House account")
+                retry_count = max_retries  # Stop retrying on auth errors
+            else:
+                retry_count += 1
             
             if retry_count >= max_retries:
-                logger.error(f"❌ Max retries ({max_retries}) reached. Giving up.")
+                logger.error(f"❌ Max retries reached")
                 return
             
             if not shutdown_flag:
-                logger.info(f"Retrying in {retry_delay}s... (attempt {retry_count}/{max_retries})")
+                logger.info(f"Retrying in {retry_delay}s... ({retry_count}/{max_retries})")
                 import time
                 time.sleep(retry_delay)
                 
         except Exception as e:
-            logger.error(f"❌ SSE stream error: {e}")
+            logger.error(f"❌ Error: {e}")
             retry_count += 1
             
             if retry_count >= max_retries:
-                logger.error(f"❌ Max retries ({max_retries}) reached. Giving up.")
+                logger.error(f"❌ Max retries reached")
                 return
             
             if not shutdown_flag:
-                logger.info(f"Retrying in {retry_delay}s... (attempt {retry_count}/{max_retries})")
+                logger.info(f"Retrying in {retry_delay}s... ({retry_count}/{max_retries})")
                 import time
                 time.sleep(retry_delay)
     
     logger.info("SSE processor shutdown complete")
 
 # ============================================================================
-# HTML DASHBOARD
+# HTML DASHBOARD (same as before - keeping it for completeness)
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -359,351 +363,56 @@ async def get_dashboard():
     <title>Companies House Monitor</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #f5f7fa;
-            color: #1a1a1a;
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f7fa; color: #1a1a1a; }
         .container { max-width: 1600px; margin: 0 auto; padding: 0 20px; }
-        header {
-            background: white;
-            border-bottom: 1px solid #e1e4e8;
-            padding: 16px 0;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
-        .header-content {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .logo {
-            font-size: 18px;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .logo-icon {
-            width: 24px;
-            height: 24px;
-            background: #0969da;
-            border-radius: 6px;
-            color: white;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 14px;
-        }
-        .status {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 13px;
-            color: #1a7f37;
-            font-weight: 500;
-        }
-        .status-dot {
-            width: 8px;
-            height: 8px;
-            background: #1a7f37;
-            border-radius: 50%;
-            animation: pulse 2s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        .metrics-bar {
-            background: white;
-            border-bottom: 1px solid #e1e4e8;
-            padding: 12px 0;
-        }
-        .metrics-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 24px;
-        }
-        .metric-label {
-            font-size: 12px;
-            color: #656d76;
-            text-transform: uppercase;
-            font-weight: 500;
-        }
-        .metric-value {
-            font-size: 24px;
-            font-weight: 600;
-            font-family: monospace;
-        }
+        header { background: white; border-bottom: 1px solid #e1e4e8; padding: 16px 0; position: sticky; top: 0; z-index: 100; }
+        .header-content { display: flex; justify-content: space-between; align-items: center; }
+        .logo { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+        .logo-icon { width: 24px; height: 24px; background: #0969da; border-radius: 6px; color: white; display: flex; align-items: center; justify-content: center; font-size: 14px; }
+        .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #1a7f37; font-weight: 500; }
+        .status-dot { width: 8px; height: 8px; background: #1a7f37; border-radius: 50%; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .metrics-bar { background: white; border-bottom: 1px solid #e1e4e8; padding: 12px 0; }
+        .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; }
+        .metric-label { font-size: 12px; color: #656d76; text-transform: uppercase; font-weight: 500; }
+        .metric-value { font-size: 24px; font-weight: 600; font-family: monospace; }
         .metric-value.target { color: #1a7f37; }
         .metric-value.total { color: #0969da; }
-        .content {
-            background: white;
-            margin: 20px 0;
-            border: 1px solid #e1e4e8;
-            border-radius: 6px;
-        }
-        .content-header {
-            padding: 16px 20px;
-            border-bottom: 1px solid #e1e4e8;
-            background: #f6f8fa;
-        }
-        .content-title {
-            font-size: 14px;
-            font-weight: 600;
-        }
-        .table-container {
-            max-height: 700px;
-            overflow-y: auto;
-        }
-        .table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-        }
-        .thead {
-            background: #f6f8fa;
-            border-bottom: 1px solid #e1e4e8;
-        }
-        .th {
-            padding: 12px 20px;
-            text-align: left;
-            font-weight: 600;
-            color: #656d76;
-            text-transform: uppercase;
-            font-size: 11px;
-        }
-        .tr {
-            border-bottom: 1px solid #e1e4e8;
-        }
-        .tr:hover {
-            background: #f6f8fa;
-        }
-        .tr.new {
-            background: #dafbe1;
-            animation: highlight 3s ease;
-        }
-        @keyframes highlight {
-            0% { background: #dafbe1; }
-            100% { background: transparent; }
-        }
-        .td {
-            padding: 12px 20px;
-        }
-        .company-number {
-            font-family: monospace;
-            font-size: 12px;
-            color: #656d76;
-        }
-        .company-name {
-            font-weight: 500;
-        }
-        .sic-code {
-            display: inline-block;
-            background: #0969da;
-            color: white;
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-size: 11px;
-            font-family: monospace;
-            margin-right: 4px;
-        }
-        .badge {
-            display: inline-block;
-            padding: 2px 10px;
-            border-radius: 10px;
-            font-size: 11px;
-            font-weight: 500;
-            text-transform: uppercase;
-        }
-        .badge.target_sic {
-            background: #dafbe1;
-            color: #1a7f37;
-        }
-        .time-ago {
-            font-family: monospace;
-            font-size: 12px;
-            color: #656d76;
-        }
-        .links a {
-            color: #0969da;
-            text-decoration: none;
-            font-size: 12px;
-            margin-right: 12px;
-        }
+        .content { background: white; margin: 20px 0; border: 1px solid #e1e4e8; border-radius: 6px; }
+        .content-header { padding: 16px 20px; border-bottom: 1px solid #e1e4e8; background: #f6f8fa; }
+        .content-title { font-size: 14px; font-weight: 600; }
+        .table-container { max-height: 700px; overflow-y: auto; }
+        .table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .thead { background: #f6f8fa; border-bottom: 1px solid #e1e4e8; }
+        .th { padding: 12px 20px; text-align: left; font-weight: 600; color: #656d76; text-transform: uppercase; font-size: 11px; }
+        .tr { border-bottom: 1px solid #e1e4e8; }
+        .tr:hover { background: #f6f8fa; }
+        .tr.new { background: #dafbe1; animation: highlight 3s ease; }
+        @keyframes highlight { 0% { background: #dafbe1; } 100% { background: transparent; } }
+        .td { padding: 12px 20px; }
+        .company-number { font-family: monospace; font-size: 12px; color: #656d76; }
+        .company-name { font-weight: 500; }
+        .sic-code { display: inline-block; background: #0969da; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-family: monospace; margin-right: 4px; }
+        .badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 11px; font-weight: 500; text-transform: uppercase; }
+        .badge.target_sic { background: #dafbe1; color: #1a7f37; }
+        .time-ago { font-family: monospace; font-size: 12px; color: #656d76; }
+        .links a { color: #0969da; text-decoration: none; font-size: 12px; margin-right: 12px; }
     </style>
 </head>
 <body>
-    <header>
-        <div class="container">
-            <div class="header-content">
-                <div class="logo">
-                    <div class="logo-icon">CH</div>
-                    Companies House Monitor
-                </div>
-                <div class="status">
-                    <div class="status-dot"></div>
-                    <span id="status-text">Connecting...</span>
-                </div>
-            </div>
-        </div>
-    </header>
-    <div class="metrics-bar">
-        <div class="container">
-            <div class="metrics-grid">
-                <div class="metric">
-                    <div class="metric-label">Target SIC</div>
-                    <div class="metric-value target" id="metric-target">0</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Total Today</div>
-                    <div class="metric-value total" id="metric-total">0</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Companies</div>
-                    <div class="metric-value" id="companies-count">0</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Status</div>
-                    <div class="metric-value" id="metric-status">Live</div>
-                </div>
-            </div>
-        </div>
-    </div>
-    <div class="container">
-        <div class="content">
-            <div class="content-header">
-                <div class="content-title">Today's Incorporations</div>
-                <div id="companies-count-header">0 companies</div>
-            </div>
-            <div class="table-container">
-                <table class="table">
-                    <thead class="thead">
-                        <tr>
-                            <th class="th">Company Number</th>
-                            <th class="th">Company Name</th>
-                            <th class="th">SIC Codes</th>
-                            <th class="th">Type</th>
-                            <th class="th">Time</th>
-                            <th class="th">Links</th>
-                        </tr>
-                    </thead>
-                    <tbody id="companies-table"></tbody>
-                </table>
-            </div>
-        </div>
-    </div>
+    <header><div class="container"><div class="header-content"><div class="logo"><div class="logo-icon">CH</div>Companies House Monitor</div><div class="status"><div class="status-dot"></div><span id="status-text">Connecting...</span></div></div></div></header>
+    <div class="metrics-bar"><div class="container"><div class="metrics-grid"><div class="metric"><div class="metric-label">Target SIC</div><div class="metric-value target" id="metric-target">0</div></div><div class="metric"><div class="metric-label">Total Today</div><div class="metric-value total" id="metric-total">0</div></div><div class="metric"><div class="metric-label">Companies</div><div class="metric-value" id="companies-count">0</div></div><div class="metric"><div class="metric-label">Status</div><div class="metric-value" id="metric-status">Live</div></div></div></div></div>
+    <div class="container"><div class="content"><div class="content-header"><div class="content-title">Today's Incorporations</div><div id="companies-count-header">0 companies</div></div><div class="table-container"><table class="table"><thead class="thead"><tr><th class="th">Company Number</th><th class="th">Company Name</th><th class="th">SIC Codes</th><th class="th">Type</th><th class="th">Time</th><th class="th">Links</th></tr></thead><tbody id="companies-table"></tbody></table></div></div></div>
     <script>
-        let companies = [];
-        let ws;
-        
-        function updateStatus(connected) {
-            const text = document.getElementById('status-text');
-            const dot = document.querySelector('.status-dot');
-            if (connected) {
-                text.textContent = 'Live';
-                text.style.color = '#1a7f37';
-                dot.style.background = '#1a7f37';
-            } else {
-                text.textContent = 'Disconnected';
-                text.style.color = '#cf222e';
-                dot.style.background = '#cf222e';
-            }
-        }
-        
-        function connect() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-            
-            ws.onopen = () => {
-                updateStatus(true);
-                fetchInitialData();
-            };
-            
-            ws.onclose = () => {
-                updateStatus(false);
-                setTimeout(connect, 3000);
-            };
-            
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                if (data.type === 'company') {
-                    addCompany(data.company);
-                } else if (data.type === 'metrics') {
-                    updateMetrics(data.metrics);
-                }
-            };
-        }
-        
-        async function fetchInitialData() {
-            const metricsRes = await fetch('/api/metrics');
-            const metrics = await metricsRes.json();
-            updateMetrics(metrics);
-            
-            const companiesRes = await fetch('/api/companies?limit=100');
-            const companiesData = await companiesRes.json();
-            companies = companiesData;
-            renderCompanies();
-        }
-        
-        function addCompany(company) {
-            const exists = companies.some(c => c.company_number === company.company_number);
-            if (exists) return;
-            
-            companies.unshift(company);
-            if (companies.length > 100) companies = companies.slice(0, 100);
-            renderCompanies();
-            fetch('/api/metrics').then(r => r.json()).then(updateMetrics);
-        }
-        
-        function updateMetrics(metrics) {
-            document.getElementById('metric-target').textContent = metrics.target_count || 0;
-            document.getElementById('metric-total').textContent = metrics.total_count || 0;
-            document.getElementById('companies-count').textContent = metrics.total_count || 0;
-            document.getElementById('companies-count-header').textContent = `${metrics.total_count} companies`;
-        }
-        
-        function renderCompanies() {
-            const tbody = document.getElementById('companies-table');
-            if (companies.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:60px;color:#656d76;">No companies yet today</td></tr>';
-                return;
-            }
-            
-            document.getElementById('companies-count-header').textContent = `${companies.length} companies`;
-            
-            tbody.innerHTML = companies.map((c, i) => `
-                <tr class="tr ${i < 5 ? 'new' : ''}">
-                    <td class="td"><div class="company-number">${c.company_number}</div></td>
-                    <td class="td"><div class="company-name">${c.company_name}</div></td>
-                    <td class="td">${c.sic_codes ? JSON.parse(c.sic_codes).slice(0,3).map(s => `<span class="sic-code">${s}</span>`).join('') : ''}</td>
-                    <td class="td"><span class="badge ${c.source_type}">${c.source_type}</span></td>
-                    <td class="td"><div class="time-ago">${formatAge(c.published_at)}</div></td>
-                    <td class="td">
-                        <a href="https://find-and-update.company-information.service.gov.uk/company/${c.company_number}" target="_blank">CH</a>
-                        <a href="https://www.google.com/search?q=${encodeURIComponent(c.company_name)}" target="_blank">Google</a>
-                    </td>
-                </tr>
-            `).join('');
-        }
-        
-        function formatAge(publishedAt) {
-            try {
-                const published = new Date(publishedAt);
-                const diff = Math.floor((new Date() - published) / 1000);
-                if (diff < 60) return `${diff}s`;
-                else if (diff < 3600) return `${Math.floor(diff / 60)}m`;
-                else return `${Math.floor(diff / 3600)}h`;
-            } catch { return 'N/A'; }
-        }
-        
-        setInterval(() => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                fetch('/api/metrics').then(r => r.json()).then(updateMetrics);
-            }
-        }, 5000);
-        
+        let companies = []; let ws;
+        function updateStatus(connected) { const t = document.getElementById('status-text'); const d = document.querySelector('.status-dot'); if (connected) { t.textContent = 'Live'; t.style.color = '#1a7f37'; d.style.background = '#1a7f37'; } else { t.textContent = 'Disconnected'; t.style.color = '#cf222e'; d.style.background = '#cf222e'; } }
+        function connect() { const p = window.location.protocol === 'https:' ? 'wss:' : 'ws:'; ws = new WebSocket(`${p}//${window.location.host}/ws`); ws.onopen = () => { updateStatus(true); fetchInitialData(); }; ws.onclose = () => { updateStatus(false); setTimeout(connect, 3000); }; ws.onmessage = (e) => { const d = JSON.parse(e.data); if (d.type === 'company') addCompany(d.company); else if (d.type === 'metrics') updateMetrics(d.metrics); }; }
+        async function fetchInitialData() { const m = await fetch('/api/metrics'); updateMetrics(await m.json()); const c = await fetch('/api/companies?limit=100'); companies = await c.json(); renderCompanies(); }
+        function addCompany(c) { if (companies.some(x => x.company_number === c.company_number)) return; companies.unshift(c); if (companies.length > 100) companies = companies.slice(0, 100); renderCompanies(); fetch('/api/metrics').then(r => r.json()).then(updateMetrics); }
+        function updateMetrics(m) { document.getElementById('metric-target').textContent = m.target_count || 0; document.getElementById('metric-total').textContent = m.total_count || 0; document.getElementById('companies-count').textContent = m.total_count || 0; document.getElementById('companies-count-header').textContent = `${m.total_count} companies`; }
+        function renderCompanies() { const t = document.getElementById('companies-table'); if (companies.length === 0) { t.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:60px;color:#656d76;">No companies yet today</td></tr>'; return; } document.getElementById('companies-count-header').textContent = `${companies.length} companies`; t.innerHTML = companies.map((c, i) => `<tr class="tr ${i < 5 ? 'new' : ''}"><td class="td"><div class="company-number">${c.company_number}</div></td><td class="td"><div class="company-name">${c.company_name}</div></td><td class="td">${c.sic_codes ? JSON.parse(c.sic_codes).slice(0,3).map(s => `<span class="sic-code">${s}</span>`).join('') : ''}</td><td class="td"><span class="badge ${c.source_type}">${c.source_type}</span></td><td class="td"><div class="time-ago">${formatAge(c.published_at)}</div></td><td class="td"><a href="https://find-and-update.company-information.service.gov.uk/company/${c.company_number}" target="_blank">CH</a><a href="https://www.google.com/search?q=${encodeURIComponent(c.company_name)}" target="_blank">Google</a></td></tr>`).join(''); }
+        function formatAge(p) { try { const d = Math.floor((new Date() - new Date(p)) / 1000); if (d < 60) return `${d}s`; else if (d < 3600) return `${Math.floor(d / 60)}m`; else return `${Math.floor(d / 3600)}h`; } catch { return 'N/A'; } }
+        setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) fetch('/api/metrics').then(r => r.json()).then(updateMetrics); }, 5000);
         connect();
     </script>
 </body>
@@ -711,25 +420,19 @@ async def get_dashboard():
     """
 
 # ============================================================================
-# WEBSOCKET ENDPOINT
+# WEBSOCKET & API ENDPOINTS
 # ============================================================================
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Handle WebSocket connections."""
     await websocket.accept()
     connected_clients.add(websocket)
     logger.info(f"✓ Client connected. Total: {len(connected_clients)}")
     
     try:
-        # Send initial metrics
         metrics = get_metrics()
-        await websocket.send_json({
-            "type": "metrics",
-            "metrics": metrics
-        })
+        await websocket.send_json({"type": "metrics", "metrics": metrics})
         
-        # Keep connection alive
         while True:
             try:
                 await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
@@ -746,49 +449,29 @@ async def websocket_endpoint(websocket: WebSocket):
         if websocket in connected_clients:
             connected_clients.remove(websocket)
 
-# ============================================================================
-# API ENDPOINTS
-# ============================================================================
-
 @app.get("/api/metrics")
 async def api_metrics():
-    """Get metrics."""
     return get_metrics()
 
 @app.get("/api/companies")
 async def api_companies(limit: int = 100):
-    """Get today's companies."""
     return get_companies(limit)
-
-# ============================================================================
-# STARTUP
-# ============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database and start SSE processor."""
     logger.info("=" * 60)
     logger.info("Companies House Monitor - Starting")
     logger.info("=" * 60)
-    
-    # Initialize database
     init_db()
-    
-    # Start SSE processor in background thread
     thread = threading.Thread(target=fetch_and_process_events, daemon=True)
     thread.start()
     logger.info("✓ SSE processor started")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown."""
     global shutdown_flag
     logger.info("Shutting down...")
     shutdown_flag = True
-
-# ============================================================================
-# MAIN
-# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
