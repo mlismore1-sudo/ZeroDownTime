@@ -20,7 +20,7 @@ import threading
 # Configuration
 SSE_URL = os.getenv("SSE_URL", "https://stream.companieshouse.gov.uk/")
 API_KEY = os.getenv("API_KEY")
-DATABASE_FILE = os.getenv("DATABASE_FILE", "/data/companies.db")
+DATABASE_FILE = os.getenv("DATABASE_FILE", "./companies.db")
 PORT = int(os.getenv("PORT", 8000))
 
 # Logging
@@ -57,7 +57,6 @@ connected_clients: Set[WebSocket] = set()
 # Global state
 shutdown_flag = False
 last_event_id = None
-db_lock = threading.Lock()
 
 # ============================================================================
 # DATABASE FUNCTIONS
@@ -65,8 +64,6 @@ db_lock = threading.Lock()
 
 def init_db():
     """Initialize SQLite database."""
-    os.makedirs(os.path.dirname(DATABASE_FILE), exist_ok=True)
-    
     conn = sqlite3.connect(DATABASE_FILE)
     with conn:
         conn.execute("""
@@ -93,79 +90,76 @@ def get_db_connection():
 
 def insert_company(company_data: dict, source_type: str):
     """Insert company into database."""
-    with db_lock:
-        try:
-            conn = get_db_connection()
-            with conn:
-                conn.execute("""
-                    INSERT OR IGNORE INTO screened_companies 
-                    (company_number, company_name, incorporation_date, sic_codes, source_type, published_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    company_data['company_number'],
-                    company_data['company_name'],
-                    company_data['incorporation_date'],
-                    json.dumps(company_data['sic_codes']),
-                    source_type,
-                    company_data['published_at']
-                ))
-            conn.close()
-            logger.info(f"✓ Inserted {company_data['company_number']}")
-        except Exception as e:
-            logger.error(f"Error inserting: {e}")
+    try:
+        conn = get_db_connection()
+        with conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO screened_companies 
+                (company_number, company_name, incorporation_date, sic_codes, source_type, published_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                company_data['company_number'],
+                company_data['company_name'],
+                company_data['incorporation_date'],
+                json.dumps(company_data['sic_codes']),
+                source_type,
+                company_data['published_at']
+            ))
+        conn.close()
+        logger.info(f"✓ Inserted {company_data['company_number']}")
+    except Exception as e:
+        logger.error(f"Error inserting: {e}")
 
 def get_companies(limit: int = 100):
     """Get today's companies from database."""
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     
-    with db_lock:
-        conn = get_db_connection()
-        cursor = conn.execute("""
-            SELECT company_number, company_name, incorporation_date, 
-                   sic_codes, source_type, published_at
-            FROM screened_companies
-            WHERE incorporation_date = ?
-            ORDER BY published_at DESC
-            LIMIT ?
-        """, (today, limit))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        return [dict(row) for row in rows]
+    conn = get_db_connection()
+    cursor = conn.execute("""
+        SELECT company_number, company_name, incorporation_date, 
+               sic_codes, source_type, published_at
+        FROM screened_companies
+        WHERE incorporation_date = ?
+        ORDER BY published_at DESC
+        LIMIT ?
+    """, (today, limit))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    return [dict(row) for row in rows]
 
 def get_metrics():
     """Get metrics from database."""
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     
-    with db_lock:
-        conn = get_db_connection()
-        
-        cursor = conn.execute("""
-            SELECT COUNT(*) FROM screened_companies 
-            WHERE incorporation_date = ? AND source_type IN ('target_sic', 'buzzword')
-        """, (today,))
-        target_count = cursor.fetchone()[0]
-        
-        cursor = conn.execute("""
-            SELECT COUNT(*) FROM screened_companies 
-            WHERE incorporation_date = ? AND source_type = 'restricted_sic'
-        """, (today,))
-        restricted_count = cursor.fetchone()[0]
-        
-        cursor = conn.execute("""
-            SELECT COUNT(*) FROM screened_companies 
-            WHERE incorporation_date = ?
-        """, (today,))
-        total_count = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        return {
-            "target_count": target_count,
-            "restricted_count": restricted_count,
-            "total_count": total_count
-        }
+    conn = get_db_connection()
+    
+    cursor = conn.execute("""
+        SELECT COUNT(*) FROM screened_companies 
+        WHERE incorporation_date = ? AND source_type IN ('target_sic', 'buzzword')
+    """, (today,))
+    target_count = cursor.fetchone()[0]
+    
+    cursor = conn.execute("""
+        SELECT COUNT(*) FROM screened_companies 
+        WHERE incorporation_date = ? AND source_type = 'restricted_sic'
+    """, (today,))
+    restricted_count = cursor.fetchone()[0]
+    
+    cursor = conn.execute("""
+        SELECT COUNT(*) FROM screened_companies 
+        WHERE incorporation_date = ?
+    """, (today,))
+    total_count = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        "target_count": target_count,
+        "restricted_count": restricted_count,
+        "total_count": total_count
+    }
 
 # ============================================================================
 # SSE STREAM PROCESSING
